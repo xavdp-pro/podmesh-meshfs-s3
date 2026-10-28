@@ -126,6 +126,18 @@ pub fn xml_escape(input: &str) -> String {
     out
 }
 
+pub fn uri_encode_sigv4(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for b in input.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~' {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
 // =============================================================================
 // Strict Input Validators (Anti-Path-Traversal)
 // =============================================================================
@@ -898,9 +910,12 @@ impl S3State {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("UNSIGNED-PAYLOAD");
 
-        let mut sorted_q: Vec<(&String, &String)> = query.iter().collect();
-        sorted_q.sort_by(|a, b| a.0.cmp(b.0));
-        let canonical_query = sorted_q
+        let mut encoded_q: Vec<(String, String)> = query
+            .iter()
+            .map(|(k, v)| (uri_encode_sigv4(k), uri_encode_sigv4(v)))
+            .collect();
+        encoded_q.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let canonical_query = encoded_q
             .into_iter()
             .map(|(k, v)| format!("{}={}", k, v))
             .collect::<Vec<_>>()
@@ -950,12 +965,13 @@ impl S3State {
             .get("X-Amz-SignedHeaders")
             .map(|s| s.as_str())
             .unwrap_or("host");
-        let mut sorted_q: Vec<(&String, &String)> = query
+        let mut encoded_q: Vec<(String, String)> = query
             .iter()
             .filter(|(k, _)| k.as_str() != "X-Amz-Signature")
+            .map(|(k, v)| (uri_encode_sigv4(k), uri_encode_sigv4(v)))
             .collect();
-        sorted_q.sort_by(|a, b| a.0.cmp(b.0));
-        let canonical_query = sorted_q
+        encoded_q.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let canonical_query = encoded_q
             .into_iter()
             .map(|(k, v)| format!("{}={}", k, v))
             .collect::<Vec<_>>()
@@ -1633,12 +1649,22 @@ async fn object_handler(
                 }
             }
 
+            // Verify all chunks in manifest before committing HTTP 200 OK headers (Fail-Closed Bit-Rot Gate)
+            for c in &manifest.chunks {
+                if let Err(e) = state.cas.read_chunk(&c.id) {
+                    return s3_error_xml(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "CASIntegrityError",
+                        &e.to_string(),
+                    );
+                }
+            }
+
             // Full GET: Stream 4 MiB chunks incrementally via Body::from_stream!
             let cas = state.cas.clone();
             let chunks_vec = manifest.chunks.clone();
-            let chunk_stream = futures_util::stream::iter(chunks_vec).map(move |c| {
-                cas.read_chunk(&c.id).map(Bytes::from)
-            });
+            let chunk_stream = futures_util::stream::iter(chunks_vec)
+                .map(move |c| cas.read_chunk(&c.id).map(Bytes::from));
 
             (
                 StatusCode::OK,
