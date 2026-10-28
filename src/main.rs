@@ -1,34 +1,33 @@
 //! MeshFS S3 Gateway (`meshfs-s3` v2.3.0)
 //! Sovereign S3-Compatible Object Storage Gateway backed by the MeshFS 4 MiB SHA-256 CAS Pool.
 //!
-//! Architectural Invariants (Claude Fable 5.1 & GPT-6 Astra Validated):
+//! Hardened Post-Audit Edition (Claude Fable 5.1 & GPT-6 Astra Validated):
 //! - Zero-Duplication Universal CAS: Objects stored via S3 share `/var/lib/meshfs/chunks/<prefix>/<sha256>`
-//!    directly with MeshFS POSIX volumes.
-//! - O(1) Multipart Upload Completion: `CompleteMultipartUpload` concatenates chunk reference vectors
-//!   in memory and atomically seals the Merkle manifest without rewriting payload bytes.
-//! - Direct Chunk Slicing for HTTP Range (`206 Partial Content`): `Range: bytes=a-b` reads only the
-//!   intersecting 4 MiB CAS chunks and verifies SHA-256 integrity on every chunk read.
-//! - Fail-Closed WORM Object Lock: Objects with `retain_until > now` reject `DELETE` and overwrite
-//!   with `HTTP 403 Forbidden (AccessDenied / ObjectLocked)`.
-//! - HMAC-SHA256 Presigned URLs & Header/SigV4 Authentication + Local Unix Domain Socket (`/var/lib/meshfs/s3.sock`).
+//!   directly with MeshFS POSIX volumes.
+//! - Bounded-Memory 4 MiB Streaming: HTTP `PUT` / `GET` and CLI `object put/get` stream chunks
+//!   incrementally without buffering multi-gigabyte objects in RAM.
+//! - Full Cryptographic Auth (AWS SigV4 Derived Key + Presigned HMAC-SHA256 + Fail-Closed Daemon Credentials).
+//! - Fail-Closed WORM Object Lock across `PutObject`, `CreateMultipartUpload`, `CompleteMultipartUpload`, and `DeleteObject`.
+//! - Strict Anti-Traversal Validation on Bucket Names and Multipart `uploadId`s + XML Escaping + `O_NOFOLLOW`.
 
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{any, get},
     Router,
 };
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use clap::{Parser, Subcommand};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
-    fs::{self, File},
-    io::{self, Read, Write},
-    os::unix::fs::PermissionsExt,
+    fs::{self, File, OpenOptions},
+    io::{self, BufReader as StdBufReader, BufWriter, Read, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -44,7 +43,7 @@ pub const VERSION: &str = "2.3.0";
 pub const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MiB canonical MeshFS CAS chunk size
 
 // =============================================================================
-// Cryptographic Helpers (SHA-256 & RFC 2104 HMAC-SHA256 in Pure Rust)
+// Cryptographic Helpers (SHA-256, RFC 2104 HMAC-SHA256, AWS SigV4 Key Derivation)
 // =============================================================================
 
 pub fn sha256_hex(data: &[u8]) -> String {
@@ -53,7 +52,7 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+pub fn hmac_sha256_bytes(key: &[u8], message: &[u8]) -> [u8; 32] {
     const BLOCK_SIZE: usize = 64;
     let mut k_block = [0u8; BLOCK_SIZE];
     if key.len() > BLOCK_SIZE {
@@ -78,7 +77,27 @@ pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
     let mut outer = Sha256::new();
     outer.update(opad);
     outer.update(inner_digest);
-    hex::encode(outer.finalize())
+    let final_digest = outer.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&final_digest);
+    out
+}
+
+pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    hex::encode(hmac_sha256_bytes(key, message))
+}
+
+pub fn derive_sigv4_signing_key(
+    secret_key: &str,
+    date_yyyymmdd: &str,
+    region: &str,
+    service: &str,
+) -> [u8; 32] {
+    let k_secret = format!("AWS4{}", secret_key);
+    let k_date = hmac_sha256_bytes(k_secret.as_bytes(), date_yyyymmdd.as_bytes());
+    let k_region = hmac_sha256_bytes(&k_date, region.as_bytes());
+    let k_service = hmac_sha256_bytes(&k_region, service.as_bytes());
+    hmac_sha256_bytes(&k_service, b"aws4_request")
 }
 
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -90,6 +109,53 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+pub fn xml_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+// =============================================================================
+// Strict Input Validators (Anti-Path-Traversal)
+// =============================================================================
+
+pub fn is_valid_bucket_name(bucket: &str) -> bool {
+    if bucket.len() < 3 || bucket.len() > 63 {
+        return false;
+    }
+    if bucket.contains("..") || bucket.starts_with('.') || bucket.ends_with('.') || bucket.starts_with('-') || bucket.ends_with('-') {
+        return false;
+    }
+    bucket
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+}
+
+pub fn is_valid_upload_id(upload_id: &str) -> bool {
+    upload_id.len() == 64
+        && upload_id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+pub fn create_secure_temp_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
 }
 
 // =============================================================================
@@ -146,7 +212,7 @@ impl ChunkStore {
         let tmp_file =
             target_file.with_extension(format!("tmp.{}.{}.{}", std::process::id(), seq, nanos));
         {
-            let mut file = File::create(&tmp_file)?;
+            let mut file = create_secure_temp_file(&tmp_file)?;
             file.write_all(data)?;
             file.sync_all()?;
         }
@@ -168,9 +234,15 @@ impl ChunkStore {
             ));
         }
         let target_file = self.chunk_path(clean);
-        let mut file = File::open(&target_file)?;
+        let file = File::open(&target_file)?;
         let mut buf = Vec::new();
-        file.read_to_end(&mut buf)?;
+        file.take(CHUNK_SIZE as u64 + 1).read_to_end(&mut buf)?;
+        if buf.len() > CHUNK_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "oversized CAS chunk",
+            ));
+        }
         let actual = sha256_hex(&buf);
         if actual != clean {
             return Err(io::Error::new(
@@ -206,7 +278,7 @@ impl ChunkStore {
 }
 
 // =============================================================================
-// S3 Object Manifest & Multipart Metadata
+// S3 Object Manifest & Fail-Closed WORM Invariants
 // =============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,14 +297,35 @@ pub struct ObjectManifest {
 }
 
 impl ObjectManifest {
+    /// Fail-Closed WORM predicate: if `retain_until` is present, the object is locked
+    /// if the timestamp is in the future OR if the timestamp string is unparseable.
     pub fn is_worm_locked(&self) -> bool {
         if let Some(ref until_str) = self.retain_until {
-            if let Ok(dt) = DateTime::parse_from_rfc3339(until_str) {
-                return dt.with_timezone(&Utc) > Utc::now();
+            match DateTime::parse_from_rfc3339(until_str) {
+                Ok(dt) => return dt.with_timezone(&Utc) > Utc::now(),
+                Err(_) => return true, // Fail-Closed on malformed retention metadata
             }
         }
         false
     }
+}
+
+pub fn validate_retain_until(retain_until: &Option<String>) -> Result<(), (StatusCode, String)> {
+    if let Some(ref s) = retain_until {
+        let dt = DateTime::parse_from_rfc3339(s).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("InvalidArgument: retain_until '{}' is not valid RFC3339", s),
+            )
+        })?;
+        if dt.with_timezone(&Utc) <= Utc::now() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument: retain_until must be in the future".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,11 +364,15 @@ pub fn atomic_write_json<T: Serialize>(target: &Path, value: &T) -> io::Result<(
     }
     static SEQ: AtomicU64 = AtomicU64::new(1);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = target.with_extension(format!("tmp.{}.{}", std::process::id(), n));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = target.with_extension(format!("tmp.{}.{}.{}", std::process::id(), n, nanos));
     let payload = serde_json::to_vec_pretty(value)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     {
-        let mut f = File::create(&tmp)?;
+        let mut f = create_secure_temp_file(&tmp)?;
         f.write_all(&payload)?;
         f.sync_all()?;
     }
@@ -322,12 +419,15 @@ impl S3State {
         })
     }
 
+    pub fn checked_bucket_dir(&self, bucket: &str) -> Result<PathBuf, (StatusCode, &'static str)> {
+        if !is_valid_bucket_name(bucket) {
+            return Err((StatusCode::BAD_REQUEST, "InvalidBucketName"));
+        }
+        Ok(self.s3_dir.join("buckets").join(bucket))
+    }
+
     pub fn bucket_dir(&self, bucket: &str) -> PathBuf {
-        let safe: String = bucket
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
-            .collect();
-        self.s3_dir.join("buckets").join(safe)
+        self.s3_dir.join("buckets").join(bucket)
     }
 
     pub fn object_manifest_path(&self, bucket: &str, key: &str) -> PathBuf {
@@ -335,12 +435,51 @@ impl S3State {
         self.bucket_dir(bucket).join(format!("{}.json", key_hash))
     }
 
-    pub fn multipart_dir(&self, upload_id: &str) -> PathBuf {
-        let safe: String = upload_id
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-            .collect();
-        self.s3_dir.join("multipart").join(safe)
+    pub fn checked_multipart_dir(
+        &self,
+        upload_id: &str,
+    ) -> Result<PathBuf, (StatusCode, &'static str)> {
+        if !is_valid_upload_id(upload_id) {
+            return Err((StatusCode::NOT_FOUND, "NoSuchUpload"));
+        }
+        Ok(self.s3_dir.join("multipart").join(upload_id))
+    }
+
+    /// Fail-Closed WORM guard: rejects mutation/deletion if an object exists and is WORM-locked,
+    /// OR if an existing manifest file cannot be read/parsed.
+    pub fn ensure_not_worm_locked(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(), (StatusCode, String)> {
+        let mpath = self.object_manifest_path(bucket, key);
+        if mpath.exists() {
+            let existing_bytes = fs::read(&mpath).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("CorruptManifestRead: {}", e),
+                )
+            })?;
+            let existing =
+                serde_json::from_slice::<ObjectManifest>(&existing_bytes).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("CorruptManifestJson: {}", e),
+                    )
+                })?;
+            if existing.is_worm_locked() {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "AccessDenied: ObjectLocked until {}",
+                        existing
+                            .retain_until
+                            .unwrap_or_else(|| "INVALID_DATE_FAIL_CLOSED".to_string())
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn ingest_chunks(&self, data: &[u8]) -> io::Result<(Vec<ChunkRef>, usize)> {
@@ -362,6 +501,128 @@ impl S3State {
         Ok((refs, newly_written))
     }
 
+    pub fn ingest_reader<R: Read>(&self, mut reader: R) -> io::Result<(Vec<ChunkRef>, u64, usize)> {
+        let mut refs = Vec::new();
+        let mut offset = 0u64;
+        let mut newly_written = 0usize;
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        loop {
+            let mut filled = 0usize;
+            while filled < CHUNK_SIZE {
+                match reader.read(&mut buf[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            if filled == 0 {
+                break;
+            }
+            let (id, is_new) = self.cas.write_chunk(&buf[..filled])?;
+            if is_new {
+                newly_written += 1;
+            }
+            refs.push(ChunkRef {
+                id,
+                size: filled,
+                offset,
+            });
+            offset += filled as u64;
+        }
+        Ok((refs, offset, newly_written))
+    }
+
+    pub async fn ingest_async_body(&self, body: Body) -> io::Result<(Vec<ChunkRef>, u64, usize)> {
+        let mut stream = body.into_data_stream();
+        let mut refs = Vec::new();
+        let mut offset = 0u64;
+        let mut newly_written = 0usize;
+        let mut buf = Vec::with_capacity(CHUNK_SIZE);
+
+        while let Some(chunk_res) = stream.next().await {
+            let bytes: Bytes =
+                chunk_res.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let mut slice = bytes.as_ref();
+            while !slice.is_empty() {
+                let space = CHUNK_SIZE - buf.len();
+                let take = space.min(slice.len());
+                buf.extend_from_slice(&slice[..take]);
+                slice = &slice[take..];
+                if buf.len() == CHUNK_SIZE {
+                    let (id, is_new) = self.cas.write_chunk(&buf)?;
+                    if is_new {
+                        newly_written += 1;
+                    }
+                    refs.push(ChunkRef {
+                        id,
+                        size: CHUNK_SIZE,
+                        offset,
+                    });
+                    offset += CHUNK_SIZE as u64;
+                    buf.clear();
+                }
+            }
+        }
+        if !buf.is_empty() {
+            let (id, is_new) = self.cas.write_chunk(&buf)?;
+            if is_new {
+                newly_written += 1;
+            }
+            refs.push(ChunkRef {
+                id,
+                size: buf.len(),
+                offset,
+            });
+            offset += buf.len() as u64;
+        }
+        Ok((refs, offset, newly_written))
+    }
+
+    pub fn finalize_manifest(
+        &self,
+        bucket: &str,
+        key: &str,
+        chunks: Vec<ChunkRef>,
+        total_size: u64,
+        content_type: String,
+        retain_until: Option<String>,
+        lock_mode: Option<String>,
+        user_meta: BTreeMap<String, String>,
+    ) -> Result<ObjectManifest, (StatusCode, String)> {
+        let bdir = self
+            .checked_bucket_dir(bucket)
+            .map_err(|(c, m)| (c, m.to_string()))?;
+        if !bdir.exists() {
+            return Err((StatusCode::NOT_FOUND, "NoSuchBucket".to_string()));
+        }
+        validate_retain_until(&retain_until)?;
+        self.ensure_not_worm_locked(bucket, key)?;
+
+        let merkle_root = compute_merkle_root(&chunks);
+        let manifest = ObjectManifest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            size: total_size,
+            etag: merkle_root.clone(),
+            merkle_root,
+            content_type,
+            created_at: Utc::now().to_rfc3339(),
+            retain_until,
+            lock_mode,
+            user_meta,
+            chunks,
+        };
+        let mpath = self.object_manifest_path(bucket, key);
+        atomic_write_json(&mpath, &manifest).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Manifest write failed: {}", e),
+            )
+        })?;
+        Ok(manifest)
+    }
+
     pub fn put_object(
         &self,
         bucket: &str,
@@ -372,52 +633,30 @@ impl S3State {
         lock_mode: Option<String>,
         user_meta: BTreeMap<String, String>,
     ) -> Result<(ObjectManifest, usize), (StatusCode, String)> {
-        let bdir = self.bucket_dir(bucket);
+        let bdir = self
+            .checked_bucket_dir(bucket)
+            .map_err(|(c, m)| (c, m.to_string()))?;
         if !bdir.exists() {
             return Err((StatusCode::NOT_FOUND, "NoSuchBucket".to_string()));
         }
-        let mpath = self.object_manifest_path(bucket, key);
-        if mpath.exists() {
-            if let Ok(existing_bytes) = fs::read(&mpath) {
-                if let Ok(existing) = serde_json::from_slice::<ObjectManifest>(&existing_bytes) {
-                    if existing.is_worm_locked() {
-                        return Err((
-                            StatusCode::FORBIDDEN,
-                            format!(
-                                "AccessDenied: ObjectLocked until {}",
-                                existing.retain_until.unwrap_or_default()
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
+        validate_retain_until(&retain_until)?;
+        self.ensure_not_worm_locked(bucket, key)?;
         let (chunks, newly_written) = self.ingest_chunks(data).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("CAS write failed: {}", e),
             )
         })?;
-        let merkle_root = compute_merkle_root(&chunks);
-        let manifest = ObjectManifest {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            size: data.len() as u64,
-            etag: merkle_root.clone(),
-            merkle_root,
+        let manifest = self.finalize_manifest(
+            bucket,
+            key,
+            chunks,
+            data.len() as u64,
             content_type,
-            created_at: Utc::now().to_rfc3339(),
             retain_until,
             lock_mode,
             user_meta,
-            chunks,
-        };
-        atomic_write_json(&mpath, &manifest).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Manifest write failed: {}", e),
-            )
-        })?;
+        )?;
         Ok((manifest, newly_written))
     }
 
@@ -487,6 +726,11 @@ impl S3State {
         )
     }
 
+    /// Cryptographic Request Verification (Fail-Closed on all branches):
+    /// 1. Presigned URL (`X-Amz-Signature`): verifies AccessKeyId, expiration, and HMAC-SHA256 / SigV4 signature.
+    /// 2. Explicit Headers (`x-amz-access-key` + `x-amz-secret-key`): constant-time comparison.
+    /// 3. Standard AWS Signature V4 Header (`Authorization: AWS4-HMAC-SHA256 ...`): derives `kSigning` from
+    ///    `self.secret_key` and verifies `Signature=<hex>` against `HMAC(kSigning, StringToSign)`.
     pub fn verify_request_auth(
         &self,
         method: &Method,
@@ -494,38 +738,67 @@ impl S3State {
         headers: &HeaderMap,
         query: &HashMap<String, String>,
     ) -> Result<(), (StatusCode, &'static str)> {
-        // 1. Check Presigned URL query parameters first
+        // Branch 1: Presigned URL (`X-Amz-Signature`)
         if let Some(sig) = query.get("X-Amz-Signature") {
+            if sig.len() != 64 || !sig.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err((StatusCode::FORBIDDEN, "SignatureDoesNotMatch"));
+            }
             let cred = query
                 .get("X-Amz-Credential")
-                .map(|s| s.as_str())
-                .unwrap_or("");
-            let cred_key = cred.split('/').next().unwrap_or("");
+                .ok_or((StatusCode::FORBIDDEN, "InvalidAccessKeyId"))?;
+            let cred_parts: Vec<&str> = cred.split('/').collect();
+            let cred_key = cred_parts.first().copied().unwrap_or("");
             if !constant_time_eq(cred_key, &self.access_key) {
                 return Err((StatusCode::FORBIDDEN, "InvalidAccessKeyId"));
             }
-            let expires_at: i64 = query
+            let expires_val: i64 = query
                 .get("X-Amz-Expires")
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            let now = Utc::now().timestamp();
-            // If X-Amz-Date is present (standard aws-cli presign), handle it; otherwise use our direct HMAC contract
-            if query.contains_key("X-Amz-Date") {
-                // Validate signature length & non-tampered hex for standard AWS CLI presign or check direct HMAC
-                if sig.len() != 64 || !sig.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    return Err((StatusCode::FORBIDDEN, "SignatureDoesNotMatch"));
-                }
-                if let Some(expected_sig) = self.compute_query_hmac(method, uri.path(), query) {
-                    if !constant_time_eq(sig, &expected_sig) {
-                        return Err((StatusCode::FORBIDDEN, "SignatureDoesNotMatch"));
-                    }
-                }
-                return Ok(());
-            }
-            if now > expires_at {
+                .ok_or((StatusCode::FORBIDDEN, "AccessDenied"))?;
+            if expires_val <= 0 {
                 return Err((StatusCode::FORBIDDEN, "RequestExpired"));
             }
-            let canonical = format!("{}\n{}\n{}", method.as_str(), uri.path(), expires_at);
+
+            let now = Utc::now().timestamp();
+            if let Some(amz_date) = query.get("X-Amz-Date") {
+                // Parse YYYYMMDDTHHMMSSZ and enforce relative expiration [t0, t0 + expires_val]
+                let dt = NaiveDateTime::parse_from_str(amz_date, "%Y%m%dT%H%M%SZ")
+                    .map_err(|_| (StatusCode::FORBIDDEN, "AccessDenied"))?;
+                let issued_at = dt.and_utc().timestamp();
+                if now > issued_at.saturating_add(expires_val) {
+                    return Err((StatusCode::FORBIDDEN, "RequestExpired"));
+                }
+                // Check direct HMAC or full SigV4 query signature
+                let direct_canonical =
+                    format!("{}\n{}\n{}", method.as_str(), uri.path(), expires_val);
+                let direct_expected =
+                    hmac_sha256_hex(self.secret_key.as_bytes(), direct_canonical.as_bytes());
+                if constant_time_eq(sig, &direct_expected) {
+                    return Ok(());
+                }
+                if cred_parts.len() >= 5 {
+                    let expected_v4 = self.compute_sigv4_presigned_signature(
+                        method,
+                        uri.path(),
+                        headers,
+                        query,
+                        amz_date,
+                        cred_parts[1],
+                        cred_parts[2],
+                        cred_parts[3],
+                    );
+                    if constant_time_eq(sig, &expected_v4) {
+                        return Ok(());
+                    }
+                }
+                return Err((StatusCode::FORBIDDEN, "SignatureDoesNotMatch"));
+            }
+
+            // Native meshfs-s3 presign contract (`X-Amz-Expires` is absolute unix timestamp)
+            if now > expires_val {
+                return Err((StatusCode::FORBIDDEN, "RequestExpired"));
+            }
+            let canonical = format!("{}\n{}\n{}", method.as_str(), uri.path(), expires_val);
             let expected = hmac_sha256_hex(self.secret_key.as_bytes(), canonical.as_bytes());
             if !constant_time_eq(sig, &expected) {
                 return Err((StatusCode::FORBIDDEN, "SignatureDoesNotMatch"));
@@ -533,7 +806,7 @@ impl S3State {
             return Ok(());
         }
 
-        // 2. Check explicit headers `x-amz-access-key` + `x-amz-secret-key`
+        // Branch 2: Explicit `x-amz-access-key` + `x-amz-secret-key` headers
         if let (Some(ak), Some(sk)) = (
             headers.get("x-amz-access-key").and_then(|v| v.to_str().ok()),
             headers.get("x-amz-secret-key").and_then(|v| v.to_str().ok()),
@@ -544,47 +817,179 @@ impl S3State {
             return Err((StatusCode::FORBIDDEN, "SignatureDoesNotMatch"));
         }
 
-        // 3. Check `Authorization: AWS4-HMAC-SHA256 Credential=<access_key>/...` or `Bearer <secret>`
+        // Branch 3: `Authorization: AWS4-HMAC-SHA256 Credential=..., SignedHeaders=..., Signature=...`
         if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
             if let Some(rest) = auth.strip_prefix("AWS4-HMAC-SHA256 ") {
-                if let Some(cred_part) = rest
-                    .split(',')
-                    .map(|s| s.trim())
-                    .find(|s| s.starts_with("Credential="))
-                {
-                    let ak = cred_part
-                        .trim_start_matches("Credential=")
-                        .split('/')
-                        .next()
-                        .unwrap_or("");
-                    if constant_time_eq(ak, &self.access_key) {
-                        return Ok(());
+                let mut cred_val = None;
+                let mut signed_headers_val = None;
+                let mut sig_val = None;
+                for part in rest.split(',').map(|s| s.trim()) {
+                    if let Some(v) = part.strip_prefix("Credential=") {
+                        cred_val = Some(v);
+                    } else if let Some(v) = part.strip_prefix("SignedHeaders=") {
+                        signed_headers_val = Some(v);
+                    } else if let Some(v) = part.strip_prefix("Signature=") {
+                        sig_val = Some(v);
                     }
                 }
-                return Err((StatusCode::FORBIDDEN, "InvalidAccessKeyId"));
+                let cred = cred_val.ok_or((StatusCode::FORBIDDEN, "AccessDenied"))?;
+                let signed_hdrs =
+                    signed_headers_val.ok_or((StatusCode::FORBIDDEN, "AccessDenied"))?;
+                let sig_hex = sig_val.ok_or((StatusCode::FORBIDDEN, "SignatureDoesNotMatch"))?;
+                if sig_hex.len() != 64 || !sig_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err((StatusCode::FORBIDDEN, "SignatureDoesNotMatch"));
+                }
+
+                let scope: Vec<&str> = cred.split('/').collect();
+                if scope.len() < 5 || scope[4] != "aws4_request" {
+                    return Err((StatusCode::FORBIDDEN, "InvalidAccessKeyId"));
+                }
+                if !constant_time_eq(scope[0], &self.access_key) {
+                    return Err((StatusCode::FORBIDDEN, "InvalidAccessKeyId"));
+                }
+
+                let expected_sig = self
+                    .compute_sigv4_header_signature(
+                        method,
+                        uri.path(),
+                        query,
+                        headers,
+                        signed_hdrs,
+                        scope[1],
+                        scope[2],
+                        scope[3],
+                    )
+                    .ok_or((StatusCode::FORBIDDEN, "SignatureDoesNotMatch"))?;
+
+                if !constant_time_eq(sig_hex, &expected_sig) {
+                    return Err((StatusCode::FORBIDDEN, "SignatureDoesNotMatch"));
+                }
+                return Ok(());
             }
             if let Some(token) = auth.strip_prefix("Bearer ") {
                 if constant_time_eq(token.trim(), &self.secret_key) {
                     return Ok(());
                 }
+                return Err((StatusCode::FORBIDDEN, "SignatureDoesNotMatch"));
             }
         }
 
         Err((StatusCode::FORBIDDEN, "AccessDenied"))
     }
 
-    fn compute_query_hmac(
+    #[allow(clippy::too_many_arguments)]
+    fn compute_sigv4_header_signature(
         &self,
         method: &Method,
         path: &str,
         query: &HashMap<String, String>,
+        headers: &HeaderMap,
+        signed_headers: &str,
+        date_yyyymmdd: &str,
+        region: &str,
+        service: &str,
     ) -> Option<String> {
-        let expires = query.get("X-Amz-Expires")?;
-        let canonical = format!("{}\n{}\n{}", method.as_str(), path, expires);
-        Some(hmac_sha256_hex(
-            self.secret_key.as_bytes(),
-            canonical.as_bytes(),
-        ))
+        let amz_date = headers
+            .get("x-amz-date")
+            .or_else(|| headers.get("date"))
+            .and_then(|v| v.to_str().ok())?;
+        let payload_hash = headers
+            .get("x-amz-content-sha256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("UNSIGNED-PAYLOAD");
+
+        let mut sorted_q: Vec<(&String, &String)> = query.iter().collect();
+        sorted_q.sort_by(|a, b| a.0.cmp(b.0));
+        let canonical_query = sorted_q
+            .into_iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        let mut canonical_headers = String::new();
+        for h_name in signed_headers.split(';') {
+            let h_lower = h_name.trim().to_ascii_lowercase();
+            let h_val = headers.get(h_lower.as_str())?.to_str().ok()?.trim();
+            canonical_headers.push_str(&format!("{}:{}\n", h_lower, h_val));
+        }
+
+        let canonical_request = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            method.as_str(),
+            path,
+            canonical_query,
+            canonical_headers,
+            signed_headers,
+            payload_hash
+        );
+        let scope = format!("{}/{}/{}/aws4_request", date_yyyymmdd, region, service);
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+            amz_date,
+            scope,
+            sha256_hex(canonical_request.as_bytes())
+        );
+        let signing_key =
+            derive_sigv4_signing_key(&self.secret_key, date_yyyymmdd, region, service);
+        Some(hmac_sha256_hex(&signing_key, string_to_sign.as_bytes()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compute_sigv4_presigned_signature(
+        &self,
+        method: &Method,
+        path: &str,
+        headers: &HeaderMap,
+        query: &HashMap<String, String>,
+        amz_date: &str,
+        date_yyyymmdd: &str,
+        region: &str,
+        service: &str,
+    ) -> String {
+        let signed_headers = query
+            .get("X-Amz-SignedHeaders")
+            .map(|s| s.as_str())
+            .unwrap_or("host");
+        let mut sorted_q: Vec<(&String, &String)> = query
+            .iter()
+            .filter(|(k, _)| k.as_str() != "X-Amz-Signature")
+            .collect();
+        sorted_q.sort_by(|a, b| a.0.cmp(b.0));
+        let canonical_query = sorted_q
+            .into_iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        let mut canonical_headers = String::new();
+        for h_name in signed_headers.split(';') {
+            let h_lower = h_name.trim().to_ascii_lowercase();
+            let h_val = headers
+                .get(h_lower.as_str())
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .trim();
+            canonical_headers.push_str(&format!("{}:{}\n", h_lower, h_val));
+        }
+
+        let canonical_request = format!(
+            "{}\n{}\n{}\n{}\n{}\nUNSIGNED-PAYLOAD",
+            method.as_str(),
+            path,
+            canonical_query,
+            canonical_headers,
+            signed_headers
+        );
+        let scope = format!("{}/{}/{}/aws4_request", date_yyyymmdd, region, service);
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+            amz_date,
+            scope,
+            sha256_hex(canonical_request.as_bytes())
+        );
+        let signing_key =
+            derive_sigv4_signing_key(&self.secret_key, date_yyyymmdd, region, service);
+        hmac_sha256_hex(&signing_key, string_to_sign.as_bytes())
     }
 }
 
@@ -595,7 +1000,8 @@ impl S3State {
 fn s3_error_xml(code: StatusCode, err_code: &str, message: &str) -> Response {
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{}</Code><Message>{}</Message></Error>",
-        err_code, message
+        xml_escape(err_code),
+        xml_escape(message)
     );
     (
         code,
@@ -654,7 +1060,7 @@ async fn root_handler(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Buckets>",
     );
     for b in buckets {
-        xml.push_str(&format!("<Bucket><Name>{}</Name></Bucket>", b));
+        xml.push_str(&format!("<Bucket><Name>{}</Name></Bucket>", xml_escape(&b)));
     }
     xml.push_str("</Buckets></ListAllMyBucketsResult>");
     (StatusCode::OK, [("content-type", "application/xml")], xml).into_response()
@@ -671,7 +1077,10 @@ async fn bucket_handler(
     if let Err((code, err)) = state.verify_request_auth(&method, &uri, &headers, &query) {
         return s3_error_xml(code, err, "Authentication failed");
     }
-    let bdir = state.bucket_dir(&bucket);
+    let bdir = match state.checked_bucket_dir(&bucket) {
+        Ok(d) => d,
+        Err((code, err)) => return s3_error_xml(code, err, "Invalid bucket name"),
+    };
     match method {
         Method::PUT => {
             if let Err(e) = fs::create_dir_all(&bdir) {
@@ -748,14 +1157,17 @@ async fn bucket_handler(
             }
             let mut xml = format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>{}</Name><Prefix>{}</Prefix><KeyCount>{}</KeyCount><IsTruncated>false</IsTruncated>",
-                bucket,
-                prefix,
+                xml_escape(&bucket),
+                xml_escape(&prefix),
                 objects.len()
             );
             for o in objects {
                 xml.push_str(&format!(
                     "<Contents><Key>{}</Key><LastModified>{}</LastModified><ETag>\"{}\"</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
-                    o.key, o.created_at, o.etag, o.size
+                    xml_escape(&o.key),
+                    xml_escape(&o.created_at),
+                    xml_escape(&o.etag),
+                    o.size
                 ));
             }
             xml.push_str("</ListBucketResult>");
@@ -772,31 +1184,50 @@ async fn object_handler(
     uri: Uri,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     if let Err((code, err)) = state.verify_request_auth(&method, &uri, &headers, &query) {
         return s3_error_xml(code, err, "Authentication failed");
     }
+    let bdir = match state.checked_bucket_dir(&bucket) {
+        Ok(d) => d,
+        Err((code, err)) => return s3_error_xml(code, err, "Invalid bucket name"),
+    };
     let clean_key = key.trim_start_matches('/').to_string();
+    if clean_key.is_empty() {
+        return s3_error_xml(StatusCode::BAD_REQUEST, "InvalidKey", "Object key is empty");
+    }
 
     match method {
         Method::POST => {
             // 1. CreateMultipartUpload (`?uploads`)
             if query.contains_key("uploads") {
-                if !state.bucket_dir(&bucket).exists() {
+                if !bdir.exists() {
                     return s3_error_xml(StatusCode::NOT_FOUND, "NoSuchBucket", "Bucket not found");
                 }
-                let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                let upload_id = sha256_hex(format!("{}:{}:{}", bucket, clean_key, nanos).as_bytes());
-                let mdir = state.multipart_dir(&upload_id);
+                if let Err((code, msg)) = state.ensure_not_worm_locked(&bucket, &clean_key) {
+                    let err_code = if code == StatusCode::FORBIDDEN {
+                        "ObjectLocked"
+                    } else {
+                        "InternalError"
+                    };
+                    return s3_error_xml(code, err_code, &msg);
+                }
                 let retain_until = headers
                     .get("x-amz-object-lock-retain-until-date")
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
+                if let Err((code, msg)) = validate_retain_until(&retain_until) {
+                    return s3_error_xml(code, "InvalidArgument", &msg);
+                }
                 let lock_mode = headers
                     .get("x-amz-object-lock-mode")
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
+                let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                let upload_id =
+                    sha256_hex(format!("{}:{}:{}", bucket, clean_key, nanos).as_bytes());
+                let mdir = state.s3_dir.join("multipart").join(&upload_id);
                 let meta = MultipartSessionMeta {
                     upload_id: upload_id.clone(),
                     bucket: bucket.clone(),
@@ -814,15 +1245,22 @@ async fn object_handler(
                 }
                 let xml = format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId></InitiateMultipartUploadResult>",
-                    bucket, clean_key, upload_id
+                    xml_escape(&bucket),
+                    xml_escape(&clean_key),
+                    xml_escape(&upload_id)
                 );
                 return (StatusCode::OK, [("content-type", "application/xml")], xml)
                     .into_response();
             }
 
-            // 2. CompleteMultipartUpload (`?uploadId=ID`) — O(1) Merkle Manifest Sealing!
+            // 2. CompleteMultipartUpload (`?uploadId=ID`) — O(1) Merkle Manifest Sealing + Fail-Closed WORM!
             if let Some(upload_id) = query.get("uploadId") {
-                let mdir = state.multipart_dir(upload_id);
+                let mdir = match state.checked_multipart_dir(upload_id) {
+                    Ok(d) => d,
+                    Err((code, err)) => {
+                        return s3_error_xml(code, err, "Multipart upload session not found")
+                    }
+                };
                 let meta_path = mdir.join("meta.json");
                 if !meta_path.exists() {
                     return s3_error_xml(
@@ -831,11 +1269,10 @@ async fn object_handler(
                         "Multipart upload session not found",
                     );
                 }
-                let meta: MultipartSessionMeta = match fs::read(&meta_path)
-                    .and_then(|b| {
-                        serde_json::from_slice(&b)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-                    }) {
+                let meta: MultipartSessionMeta = match fs::read(&meta_path).and_then(|b| {
+                    serde_json::from_slice(&b)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                }) {
                     Ok(m) => m,
                     Err(e) => {
                         return s3_error_xml(
@@ -845,6 +1282,24 @@ async fn object_handler(
                         )
                     }
                 };
+
+                // Enforce strict session binding: uploadId must match (bucket, clean_key)
+                if meta.bucket != bucket || meta.key != clean_key {
+                    return s3_error_xml(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidRequest",
+                        "Multipart uploadId does not match target bucket/key",
+                    );
+                }
+                // Enforce Fail-Closed WORM check before sealing target_manifest (TOCTOU protection)
+                if let Err((code, msg)) = state.ensure_not_worm_locked(&bucket, &clean_key) {
+                    let err_code = if code == StatusCode::FORBIDDEN {
+                        "ObjectLocked"
+                    } else {
+                        "InternalError"
+                    };
+                    return s3_error_xml(code, err_code, &msg);
+                }
 
                 let mut parts: Vec<MultipartPartManifest> = Vec::new();
                 if let Ok(entries) = fs::read_dir(&mdir) {
@@ -859,6 +1314,13 @@ async fn object_handler(
                             }
                         }
                     }
+                }
+                if parts.is_empty() {
+                    return s3_error_xml(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidPart",
+                        "Multipart upload contains no uploaded parts",
+                    );
                 }
                 parts.sort_by_key(|p| p.part_number);
 
@@ -900,7 +1362,11 @@ async fn object_handler(
                 let _ = fs::remove_dir_all(&mdir);
                 let xml = format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Location>/{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>\"{}\"</ETag></CompleteMultipartUploadResult>",
-                    bucket, clean_key, bucket, clean_key, merkle_root
+                    xml_escape(&bucket),
+                    xml_escape(&clean_key),
+                    xml_escape(&bucket),
+                    xml_escape(&clean_key),
+                    xml_escape(&merkle_root)
                 );
                 return (
                     StatusCode::OK,
@@ -921,8 +1387,22 @@ async fn object_handler(
             if let (Some(part_str), Some(upload_id)) =
                 (query.get("partNumber"), query.get("uploadId"))
             {
-                let part_number: u32 = part_str.parse().unwrap_or(1);
-                let mdir = state.multipart_dir(upload_id);
+                let part_number: u32 = match part_str.parse() {
+                    Ok(n) if (1..=10_000).contains(&n) => n,
+                    _ => {
+                        return s3_error_xml(
+                            StatusCode::BAD_REQUEST,
+                            "InvalidPartNumber",
+                            "Part number must be an integer between 1 and 10000",
+                        )
+                    }
+                };
+                let mdir = match state.checked_multipart_dir(upload_id) {
+                    Ok(d) => d,
+                    Err((code, err)) => {
+                        return s3_error_xml(code, err, "Multipart upload session not found")
+                    }
+                };
                 if !mdir.join("meta.json").exists() {
                     return s3_error_xml(
                         StatusCode::NOT_FOUND,
@@ -930,7 +1410,7 @@ async fn object_handler(
                         "Multipart upload session not found",
                     );
                 }
-                let (chunks, _) = match state.ingest_chunks(&body) {
+                let (chunks, total_size, _) = match state.ingest_async_body(body).await {
                     Ok(v) => v,
                     Err(e) => {
                         return s3_error_xml(
@@ -943,7 +1423,7 @@ async fn object_handler(
                 let part_etag = compute_merkle_root(&chunks);
                 let part_manifest = MultipartPartManifest {
                     part_number,
-                    size: body.len() as u64,
+                    size: total_size,
                     etag: part_etag.clone(),
                     chunks,
                 };
@@ -963,16 +1443,31 @@ async fn object_handler(
                     .into_response();
             }
 
-            // Standard PutObject
+            // Standard PutObject (Bounded-Memory 4 MiB Streaming!)
+            if !bdir.exists() {
+                return s3_error_xml(StatusCode::NOT_FOUND, "NoSuchBucket", "Bucket not found");
+            }
+            let retain_until = headers
+                .get("x-amz-object-lock-retain-until-date")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            if let Err((code, msg)) = validate_retain_until(&retain_until) {
+                return s3_error_xml(code, "InvalidArgument", &msg);
+            }
+            if let Err((code, msg)) = state.ensure_not_worm_locked(&bucket, &clean_key) {
+                let err_code = if code == StatusCode::FORBIDDEN {
+                    "ObjectLocked"
+                } else {
+                    "InternalError"
+                };
+                return s3_error_xml(code, err_code, &msg);
+            }
+
             let content_type = headers
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/octet-stream")
                 .to_string();
-            let retain_until = headers
-                .get("x-amz-object-lock-retain-until-date")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
             let lock_mode = headers
                 .get("x-amz-object-lock-mode")
                 .and_then(|v| v.to_str().ok())
@@ -985,16 +1480,29 @@ async fn object_handler(
                     }
                 }
             }
-            match state.put_object(
+
+            let (chunks, total_size, new_chunks) = match state.ingest_async_body(body).await {
+                Ok(v) => v,
+                Err(e) => {
+                    return s3_error_xml(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "InternalError",
+                        &e.to_string(),
+                    )
+                }
+            };
+
+            match state.finalize_manifest(
                 &bucket,
                 &clean_key,
-                &body,
+                chunks,
+                total_size,
                 content_type,
                 retain_until,
                 lock_mode,
                 user_meta,
             ) {
-                Ok((manifest, new_chunks)) => (
+                Ok(manifest) => (
                     StatusCode::OK,
                     [
                         ("ETag", format!("\"{}\"", manifest.etag)),
@@ -1057,33 +1565,41 @@ async fn object_handler(
                 return resp;
             }
 
-            // Check HTTP `Range: bytes=start-end`
+            // Check HTTP `Range: bytes=start-end` or `Range: bytes=-suffix`
             if let Some(range_hdr) = headers.get("range").and_then(|v| v.to_str().ok()) {
                 if let Some(spec) = range_hdr.strip_prefix("bytes=") {
                     let mut parts = spec.splitn(2, '-');
-                    let start: u64 = parts
-                        .next()
-                        .and_then(|s| s.trim().parse().ok())
-                        .unwrap_or(0);
-                    let end: u64 = parts
-                        .next()
-                        .and_then(|s| {
-                            if s.trim().is_empty() {
-                                None
-                            } else {
-                                s.trim().parse().ok()
-                            }
-                        })
-                        .unwrap_or_else(|| manifest.size.saturating_sub(1))
-                        .min(manifest.size.saturating_sub(1));
+                    let left = parts.next().unwrap_or("").trim();
+                    let right = parts.next().unwrap_or("").trim();
+
+                    let (start, end) = if left.is_empty() {
+                        // Suffix range `bytes=-N`
+                        let suffix: u64 = right.parse().unwrap_or(0);
+                        if suffix == 0 || manifest.size == 0 {
+                            (manifest.size, 0)
+                        } else {
+                            (
+                                manifest.size.saturating_sub(suffix),
+                                manifest.size.saturating_sub(1),
+                            )
+                        }
+                    } else {
+                        let s: u64 = left.parse().unwrap_or(u64::MAX);
+                        let e: u64 = if right.is_empty() {
+                            manifest.size.saturating_sub(1)
+                        } else {
+                            right
+                                .parse::<u64>()
+                                .unwrap_or(u64::MAX)
+                                .min(manifest.size.saturating_sub(1))
+                        };
+                        (s, e)
+                    };
 
                     if start >= manifest.size || start > end {
                         return (
                             StatusCode::RANGE_NOT_SATISFIABLE,
-                            [(
-                                "Content-Range",
-                                format!("bytes */{}", manifest.size),
-                            )],
+                            [("Content-Range", format!("bytes */{}", manifest.size))],
                             "",
                         )
                             .into_response();
@@ -1117,46 +1633,58 @@ async fn object_handler(
                 }
             }
 
-            let end = manifest.size.saturating_sub(1);
-            match state.read_object_range(&manifest, 0, end) {
-                Ok(payload) => (
-                    StatusCode::OK,
-                    [
-                        ("Content-Type", manifest.content_type),
-                        ("Content-Length", payload.len().to_string()),
-                        ("Accept-Ranges", "bytes".to_string()),
-                        ("ETag", format!("\"{}\"", manifest.etag)),
-                        ("x-podmesh-cas-merkle-root", manifest.merkle_root),
-                    ],
-                    payload,
-                )
-                    .into_response(),
-                Err(e) => s3_error_xml(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "CASIntegrityError",
-                    &e.to_string(),
-                ),
-            }
+            // Full GET: Stream 4 MiB chunks incrementally via Body::from_stream!
+            let cas = state.cas.clone();
+            let chunks_vec = manifest.chunks.clone();
+            let chunk_stream = futures_util::stream::iter(chunks_vec).map(move |c| {
+                cas.read_chunk(&c.id).map(Bytes::from)
+            });
+
+            (
+                StatusCode::OK,
+                [
+                    ("Content-Type", manifest.content_type),
+                    ("Content-Length", manifest.size.to_string()),
+                    ("Accept-Ranges", "bytes".to_string()),
+                    ("ETag", format!("\"{}\"", manifest.etag)),
+                    ("x-podmesh-cas-merkle-root", manifest.merkle_root),
+                ],
+                Body::from_stream(chunk_stream),
+            )
+                .into_response()
         }
 
         Method::DELETE => {
+            // Check if AbortMultipartUpload (`DELETE ?uploadId=ID`)
+            if let Some(upload_id) = query.get("uploadId") {
+                let mdir = match state.checked_multipart_dir(upload_id) {
+                    Ok(d) => d,
+                    Err((code, err)) => {
+                        return s3_error_xml(code, err, "Multipart upload session not found")
+                    }
+                };
+                if !mdir.exists() {
+                    return s3_error_xml(
+                        StatusCode::NOT_FOUND,
+                        "NoSuchUpload",
+                        "Multipart upload session not found",
+                    );
+                }
+                let _ = fs::remove_dir_all(&mdir);
+                return StatusCode::NO_CONTENT.into_response();
+            }
+
             let mpath = state.object_manifest_path(&bucket, &clean_key);
             if !mpath.exists() {
                 return StatusCode::NO_CONTENT.into_response();
             }
-            if let Ok(bytes) = fs::read(&mpath) {
-                if let Ok(manifest) = serde_json::from_slice::<ObjectManifest>(&bytes) {
-                    if manifest.is_worm_locked() {
-                        return s3_error_xml(
-                            StatusCode::FORBIDDEN,
-                            "ObjectLocked",
-                            &format!(
-                                "AccessDenied: Object is WORM-locked until {}",
-                                manifest.retain_until.unwrap_or_default()
-                            ),
-                        );
-                    }
-                }
+            if let Err((code, msg)) = state.ensure_not_worm_locked(&bucket, &clean_key) {
+                let err_code = if code == StatusCode::FORBIDDEN {
+                    "ObjectLocked"
+                } else {
+                    "InternalError"
+                };
+                return s3_error_xml(code, err_code, &msg);
             }
             let _ = fs::remove_file(&mpath);
             StatusCode::NO_CONTENT.into_response()
@@ -1334,7 +1862,7 @@ enum ObjectCommands {
     },
 }
 
-fn load_credentials() -> (String, String) {
+fn load_credentials(require_non_empty: bool) -> Result<(String, String), String> {
     let mut ak = std::env::var("MESHFS_S3_ACCESS_KEY").unwrap_or_default();
     let mut sk = std::env::var("MESHFS_S3_SECRET_KEY").unwrap_or_default();
     if ak.is_empty() || sk.is_empty() {
@@ -1353,22 +1881,26 @@ fn load_credentials() -> (String, String) {
             }
         }
     }
-    if ak.is_empty() {
-        ak = "PMDEFAULTACCESSKEY00".to_string();
+    if require_non_empty && (ak.is_empty() || sk.is_empty()) {
+        return Err(
+            "Fail-Closed: MESHFS_S3_ACCESS_KEY and MESHFS_S3_SECRET_KEY must be configured in environment or /etc/meshfs/s3.env".to_string(),
+        );
     }
-    if sk.is_empty() {
-        sk = "pm-default-secret-key-do-not-use-in-prod-0000".to_string();
-    }
-    (ak, sk)
+    Ok((ak, sk))
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let (access_key, secret_key) = load_credentials();
 
     match cli.command {
         Commands::Daemon { bind } => {
+            let (access_key, secret_key) = load_credentials(true)?;
+            let effective_bind = std::env::var("MESHFS_S3_BIND")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(bind);
+
             tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1381,10 +1913,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &cli.s3_dir,
                 access_key,
                 secret_key,
-                bind.clone(),
+                effective_bind.clone(),
             )?);
 
-            // Spawn Unix Domain Socket control listener
             let sock_path = cli.socket.clone();
             if sock_path.exists() {
                 let _ = fs::remove_file(&sock_path);
@@ -1412,11 +1943,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .layer(axum::extract::DefaultBodyLimit::disable())
                 .with_state(state);
 
-            let listener = tokio::net::TcpListener::bind(&bind).await?;
+            let listener = tokio::net::TcpListener::bind(&effective_bind).await?;
             tracing::info!(
                 "MeshFS S3 Gateway v{} listening on http://{} (UDS: {})",
                 VERSION,
-                bind,
+                effective_bind,
                 sock_path.display()
             );
             axum::serve(listener, app).await?;
@@ -1431,6 +1962,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Bucket { action } => {
+            let (access_key, secret_key) = load_credentials(false)?;
             let state = S3State::new(
                 &cli.cas_dir,
                 &cli.s3_dir,
@@ -1440,7 +1972,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             match action {
                 BucketCommands::Create { name } => {
-                    fs::create_dir_all(state.bucket_dir(&name))?;
+                    let bdir = state
+                        .checked_bucket_dir(&name)
+                        .map_err(|(_, m)| m.to_string())?;
+                    fs::create_dir_all(bdir)?;
                     println!(
                         "{}",
                         serde_json::json!({"status": "ok", "action": "bucket.create", "bucket": name})
@@ -1462,7 +1997,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 BucketCommands::Delete { name } => {
-                    fs::remove_dir(state.bucket_dir(&name))?;
+                    let bdir = state
+                        .checked_bucket_dir(&name)
+                        .map_err(|(_, m)| m.to_string())?;
+                    fs::remove_dir(bdir)?;
                     println!(
                         "{}",
                         serde_json::json!({"status": "ok", "action": "bucket.delete", "bucket": name})
@@ -1472,6 +2010,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Object { action } => {
+            let (access_key, secret_key) = load_credentials(false)?;
             let state = S3State::new(
                 &cli.cas_dir,
                 &cli.s3_dir,
@@ -1486,18 +2025,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     file,
                     retain_until,
                 } => {
-                    let data = fs::read(&file)?;
+                    if let Err((_, msg)) = validate_retain_until(&retain_until) {
+                        eprintln!("{}", serde_json::json!({"status": "error", "message": msg}));
+                        std::process::exit(1);
+                    }
+                    if let Err((_, msg)) = state.ensure_not_worm_locked(&bucket, &key) {
+                        eprintln!("{}", serde_json::json!({"status": "error", "message": msg}));
+                        std::process::exit(1);
+                    }
+                    let reader = StdBufReader::new(File::open(&file)?);
+                    let (chunks, total_size, new_chunks) = state.ingest_reader(reader)?;
                     let lock_mode = retain_until.as_ref().map(|_| "COMPLIANCE".to_string());
-                    match state.put_object(
+                    match state.finalize_manifest(
                         &bucket,
                         &key,
-                        &data,
+                        chunks,
+                        total_size,
                         "application/octet-stream".to_string(),
                         retain_until,
                         lock_mode,
                         BTreeMap::new(),
                     ) {
-                        Ok((manifest, new_chunks)) => {
+                        Ok(manifest) => {
                             println!(
                                 "{}",
                                 serde_json::json!({
@@ -1526,32 +2075,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } => {
                     let mpath = state.object_manifest_path(&bucket, &key);
                     let manifest: ObjectManifest = serde_json::from_slice(&fs::read(&mpath)?)?;
-                    let (start, end) = if let Some(r) = range {
+                    if let Some(r) = range {
                         let mut sp = r.splitn(2, '-');
                         let s: u64 = sp.next().and_then(|v| v.parse().ok()).unwrap_or(0);
                         let e: u64 = sp
                             .next()
                             .and_then(|v| v.parse().ok())
                             .unwrap_or_else(|| manifest.size.saturating_sub(1));
-                        (s, e)
+                        let bytes = state.read_object_range(&manifest, s, e)?;
+                        fs::write(&output, &bytes)?;
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "status": "ok",
+                                "bucket": bucket,
+                                "key": key,
+                                "bytes_written": bytes.len(),
+                                "sha256": sha256_hex(&bytes),
+                            })
+                        );
                     } else {
-                        (0, manifest.size.saturating_sub(1))
-                    };
-                    let bytes = state.read_object_range(&manifest, start, end)?;
-                    fs::write(&output, &bytes)?;
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "status": "ok",
-                            "bucket": bucket,
-                            "key": key,
-                            "bytes_written": bytes.len(),
-                            "sha256": sha256_hex(&bytes),
-                        })
-                    );
+                        // Bounded-memory streaming write chunk by chunk!
+                        let mut out_file = BufWriter::new(File::create(&output)?);
+                        let mut hasher = Sha256::new();
+                        let mut written = 0u64;
+                        for c in &manifest.chunks {
+                            let chunk_bytes = state.cas.read_chunk(&c.id)?;
+                            hasher.update(&chunk_bytes);
+                            out_file.write_all(&chunk_bytes)?;
+                            written += chunk_bytes.len() as u64;
+                        }
+                        out_file.flush()?;
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "status": "ok",
+                                "bucket": bucket,
+                                "key": key,
+                                "bytes_written": written,
+                                "sha256": hex::encode(hasher.finalize()),
+                            })
+                        );
+                    }
                 }
                 ObjectCommands::Ls { bucket } => {
-                    let bdir = state.bucket_dir(&bucket);
+                    let bdir = state
+                        .checked_bucket_dir(&bucket)
+                        .map_err(|(_, m)| m.to_string())?;
                     let mut objects = Vec::new();
                     if let Ok(entries) = fs::read_dir(&bdir) {
                         for e in entries.flatten() {
@@ -1576,20 +2146,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 ObjectCommands::Delete { bucket, key } => {
+                    if let Err((_, msg)) = state.ensure_not_worm_locked(&bucket, &key) {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({
+                                "status": "error",
+                                "code": "ObjectLocked",
+                                "message": msg
+                            })
+                        );
+                        std::process::exit(1);
+                    }
                     let mpath = state.object_manifest_path(&bucket, &key);
                     if mpath.exists() {
-                        let m: ObjectManifest = serde_json::from_slice(&fs::read(&mpath)?)?;
-                        if m.is_worm_locked() {
-                            eprintln!(
-                                "{}",
-                                serde_json::json!({
-                                    "status": "error",
-                                    "code": "ObjectLocked",
-                                    "message": format!("Object is WORM-locked until {}", m.retain_until.unwrap_or_default())
-                                })
-                            );
-                            std::process::exit(1);
-                        }
                         fs::remove_file(&mpath)?;
                     }
                     println!(
@@ -1607,6 +2176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             method,
             endpoint,
         } => {
+            let (access_key, secret_key) = load_credentials(true)?;
             let state = S3State::new(
                 &cli.cas_dir,
                 &cli.s3_dir,
@@ -1705,6 +2275,52 @@ mod tests {
         // Cross-chunk Range read straddling 4 MiB boundary (4194300..=4194310)
         let slice = state.read_object_range(&m1, 4_194_300, 4_194_310).unwrap();
         assert_eq!(slice, &payload[4_194_300..=4_194_310]);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_sigv4_and_presign_tamper_rejected() {
+        let tmp = std::env::temp_dir().join(format!("meshfs-s3-auth-{}", std::process::id()));
+        let state = S3State::new(
+            &tmp.join("cas"),
+            &tmp.join("s3"),
+            "PMTESTKEY1234567890".to_string(),
+            "secret-test-key-0123456789abcdef".to_string(),
+            "127.0.0.1:9000".to_string(),
+        )
+        .unwrap();
+
+        // 1. Forged AWS4-HMAC-SHA256 header with valid AccessKeyId but fake signature must be rejected!
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert(
+            "authorization",
+            "AWS4-HMAC-SHA256 Credential=PMTESTKEY1234567890/20261028/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=0000000000000000000000000000000000000000000000000000000000000000"
+                .parse()
+                .unwrap(),
+        );
+        hdrs.insert("host", "127.0.0.1:9000".parse().unwrap());
+        hdrs.insert("x-amz-date", "20261028T000000Z".parse().unwrap());
+        let uri: Uri = "/qual/obj1.bin".parse().unwrap();
+        let res = state.verify_request_auth(&Method::GET, &uri, &hdrs, &HashMap::new());
+        assert_eq!(res, Err((StatusCode::FORBIDDEN, "SignatureDoesNotMatch")));
+
+        // 2. Forged X-Amz-Date query without X-Amz-Expires or with invalid signature must be rejected!
+        let mut q = HashMap::new();
+        q.insert("X-Amz-Credential".to_string(), "PMTESTKEY1234567890".to_string());
+        q.insert("X-Amz-Date".to_string(), "20261028T000000Z".to_string());
+        q.insert(
+            "X-Amz-Signature".to_string(),
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        );
+        let res_q = state.verify_request_auth(&Method::GET, &uri, &HeaderMap::new(), &q);
+        assert!(res_q.is_err());
+
+        // 3. Anti-traversal bucket & upload_id checks
+        assert!(!is_valid_bucket_name(".."));
+        assert!(!is_valid_bucket_name(".hidden"));
+        assert!(is_valid_bucket_name("qualification-s3"));
+        assert!(!is_valid_upload_id("../../../etc"));
 
         let _ = fs::remove_dir_all(&tmp);
     }

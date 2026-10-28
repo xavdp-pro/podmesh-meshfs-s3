@@ -135,7 +135,8 @@ EOT
 
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
         systemctl daemon-reload >/dev/null 2>&1 || true
-        systemctl enable --now meshfs-s3.service >/dev/null 2>&1 || true
+        systemctl enable meshfs-s3.service >/dev/null 2>&1 || true
+        systemctl restart meshfs-s3.service >/dev/null 2>&1 || true
         echo "[MeshFS-S3] Service meshfs-s3.service (v2.3.0) enabled and started on 127.0.0.1:9000 + /var/lib/meshfs/s3.sock."
     fi
 fi
@@ -165,7 +166,7 @@ cat <<'EOF' > "${BUILD_DIR}/DEBIAN/postrm"
 set -e
 
 if [ "$1" = "purge" ]; then
-    rm -f /etc/meshfs/s3.env /etc/meshfs/s3.json /var/lib/meshfs/s3.sock
+    rm -rf /etc/meshfs/s3.env /etc/meshfs/s3.json /var/lib/meshfs/s3.sock /var/lib/meshfs/s3
 fi
 
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
