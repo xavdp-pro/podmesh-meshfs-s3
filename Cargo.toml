@@ -1,0 +1,29 @@
+[package]
+name = "meshfs-s3"
+version = "2.3.0"
+edition = "2021"
+authors = ["Xavier de Poorter <xavier@xavdp.pro>", "PodMesh Team"]
+description = "Sovereign S3-Compatible Object Storage Gateway backed by MeshFS 4 MiB SHA-256 CAS (v2.3.0)"
+license = "Apache-2.0"
+
+[[bin]]
+name = "meshfs-s3"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7" }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+hex = "0.4"
+clap = { version = "4.4", features = ["derive"] }
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1.5"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+base64 = "0.22"
+futures-util = "0.3"
