@@ -184,13 +184,29 @@ pub struct ChunkRef {
 #[derive(Debug, Clone)]
 pub struct ChunkStore {
     pub chunks_dir: PathBuf,
+    pub peers: Vec<String>,
+    pub auth_secret: Option<String>,
+    pub self_healed_chunks: Arc<AtomicU64>,
 }
 
 impl ChunkStore {
     pub fn new(cas_root: &Path) -> io::Result<Self> {
+        Self::with_peers(cas_root, Vec::new(), None)
+    }
+
+    pub fn with_peers(
+        cas_root: &Path,
+        peers: Vec<String>,
+        auth_secret: Option<String>,
+    ) -> io::Result<Self> {
         let chunks_dir = cas_root.join("chunks");
         fs::create_dir_all(&chunks_dir)?;
-        Ok(Self { chunks_dir })
+        Ok(Self {
+            chunks_dir,
+            peers,
+            auth_secret,
+            self_healed_chunks: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     pub fn normalize_id(id: &str) -> &str {
@@ -208,9 +224,19 @@ impl ChunkStore {
         let target_file = self.chunk_path(&digest);
 
         if target_file.exists() {
-            return Ok((format!("sha256:{}", digest), false));
+            if let Ok(existing) = fs::read(&target_file) {
+                if existing.len() <= CHUNK_SIZE && sha256_hex(&existing) == digest {
+                    return Ok((format!("sha256:{}", digest), false));
+                }
+            }
         }
 
+        self.write_verified_chunk_raw(&digest, data)?;
+        Ok((format!("sha256:{}", digest), true))
+    }
+
+    pub fn write_verified_chunk_raw(&self, clean_digest: &str, data: &[u8]) -> io::Result<()> {
+        let target_file = self.chunk_path(clean_digest);
         if let Some(parent) = target_file.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -234,7 +260,63 @@ impl ChunkStore {
                 let _ = dir.sync_all();
             }
         }
-        Ok((format!("sha256:{}", digest), true))
+        Ok(())
+    }
+
+    fn try_heal_from_peers(&self, clean: &str) -> Option<Vec<u8>> {
+        if self.peers.is_empty() {
+            return None;
+        }
+        let clean_owned = clean.to_string();
+        let peers = self.peers.clone();
+        let secret = self.auth_secret.clone();
+
+        // Spawn an isolated OS thread for blocking reqwest so it safely executes inside or outside a Tokio runtime
+        let fetched = std::thread::spawn(move || -> Option<Vec<u8>> {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .ok()?;
+            for peer in &peers {
+                let base = peer.trim_end_matches('/');
+                let candidate_urls = [
+                    format!("{}/cas/chunk/{}", base, clean_owned),
+                    format!("{}/api/v1/meshfs/cas/chunk/{}", base, clean_owned),
+                ];
+                for url in &candidate_urls {
+                    let mut req = client.get(url);
+                    if let Some(ref sk) = secret {
+                        if !sk.is_empty() {
+                            req = req.header("Authorization", format!("Bearer {}", sk));
+                        }
+                    }
+                    if let Ok(resp) = req.send() {
+                        if resp.status().is_success() {
+                            if let Ok(bytes) = resp.bytes() {
+                                if bytes.len() <= CHUNK_SIZE && sha256_hex(&bytes) == clean_owned {
+                                    tracing::warn!(
+                                        chunk = %clean_owned,
+                                        peer = %base,
+                                        "P2P Self-Healing: recovered & verified intact CAS chunk from peer"
+                                    );
+                                    return Some(bytes.to_vec());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        })
+        .join()
+        .ok()
+        .flatten()?;
+
+        if self.write_verified_chunk_raw(clean, &fetched).is_ok() {
+            self.self_healed_chunks.fetch_add(1, Ordering::Relaxed);
+            return Some(fetched);
+        }
+        None
     }
 
     pub fn read_chunk(&self, chunk_id: &str) -> io::Result<Vec<u8>> {
@@ -246,46 +328,70 @@ impl ChunkStore {
             ));
         }
         let target_file = self.chunk_path(clean);
-        let file = File::open(&target_file)?;
-        let mut buf = Vec::new();
-        file.take(CHUNK_SIZE as u64 + 1).read_to_end(&mut buf)?;
-        if buf.len() > CHUNK_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "oversized CAS chunk",
-            ));
+        match File::open(&target_file) {
+            Ok(file) => {
+                let mut buf = Vec::new();
+                file.take(CHUNK_SIZE as u64 + 1).read_to_end(&mut buf)?;
+                if buf.len() > CHUNK_SIZE {
+                    if let Some(healed) = self.try_heal_from_peers(clean) {
+                        return Ok(healed);
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "oversized CAS chunk",
+                    ));
+                }
+                let actual = sha256_hex(&buf);
+                if actual != clean {
+                    if let Some(healed) = self.try_heal_from_peers(clean) {
+                        return Ok(healed);
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "CAS bit-rot detected on chunk {}: expected {}, got {}",
+                            clean, clean, actual
+                        ),
+                    ));
+                }
+                Ok(buf)
+            }
+            Err(e) => {
+                if let Some(healed) = self.try_heal_from_peers(clean) {
+                    return Ok(healed);
+                }
+                Err(e)
+            }
         }
-        let actual = sha256_hex(&buf);
-        if actual != clean {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "CAS bit-rot detected on chunk {}: expected {}, got {}",
-                    clean, clean, actual
-                ),
-            ));
-        }
-        Ok(buf)
     }
 
-    pub fn count_chunks(&self) -> usize {
+    pub fn count_chunks_and_bytes(&self) -> (usize, u64) {
         let mut count = 0usize;
+        let mut total_bytes = 0u64;
         if let Ok(entries) = fs::read_dir(&self.chunks_dir) {
             for e in entries.flatten() {
                 if e.path().is_dir() {
                     if let Ok(sub) = fs::read_dir(e.path()) {
                         for f in sub.flatten() {
-                            if f.path().is_file()
+                            let p = f.path();
+                            if p.is_file()
                                 && !f.file_name().to_string_lossy().contains(".tmp.")
                             {
                                 count += 1;
+                                if let Ok(meta) = f.metadata() {
+                                    total_bytes += meta.len();
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        count
+        (count, total_bytes)
+    }
+
+    pub fn count_chunks(&self) -> usize {
+        self.count_chunks_and_bytes().0
     }
 }
 
@@ -397,12 +503,104 @@ pub fn atomic_write_json<T: Serialize>(target: &Path, value: &T) -> io::Result<(
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BucketQuota {
+    pub bucket: String,
+    pub max_bytes: u64,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcReport {
+    pub status: String,
+    pub dry_run: bool,
+    pub grace_seconds: u64,
+    pub referenced_chunks: usize,
+    pub scanned_chunks: usize,
+    pub deleted_chunks: usize,
+    pub reclaimed_bytes: u64,
+    pub retained_physical_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct S3Telemetry {
+    pub buckets_count: usize,
+    pub objects_count: usize,
+    pub worm_locked_objects: usize,
+    pub logical_bytes: u64,
+    pub physical_cas_chunks: usize,
+    pub physical_cas_bytes: u64,
+    pub dedup_saved_bytes: u64,
+    pub dedup_ratio: f64,
+    pub self_healed_chunks: u64,
+}
+
+fn collect_cas_hashes_from_value(
+    val: &serde_json::Value,
+    referenced: &mut std::collections::HashSet<String>,
+) {
+    match val {
+        serde_json::Value::String(s) => {
+            let clean = s.strip_prefix("sha256:").unwrap_or(s.as_str());
+            if clean.len() == 64
+                && clean
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                referenced.insert(clean.to_string());
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                collect_cas_hashes_from_value(item, referenced);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                // Only collect 64-hex strings from chunk/digest fields or sha256:-prefixed strings
+                if let serde_json::Value::String(s) = v {
+                    if s.starts_with("sha256:") || k == "id" || k == "chunk" || k == "hash" {
+                        collect_cas_hashes_from_value(v, referenced);
+                    }
+                } else {
+                    collect_cas_hashes_from_value(v, referenced);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_cas_hashes_from_dir(dir: &Path, referenced: &mut std::collections::HashSet<String>) {
+    if !dir.exists() {
+        return;
+    }
+    if let Ok(entries) = fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if p.file_name().and_then(|n| n.to_str()) == Some("chunks") {
+                    continue;
+                }
+                collect_cas_hashes_from_dir(&p, referenced);
+            } else if p.extension().and_then(|s| s.to_str()) == Some("json") {
+                if let Ok(bytes) = fs::read(&p) {
+                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        collect_cas_hashes_from_value(&val, referenced);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // =============================================================================
 // MeshFS S3 Engine State
 // =============================================================================
 
 #[derive(Clone)]
 pub struct S3State {
+    pub cas_root: PathBuf,
     pub cas: ChunkStore,
     pub s3_dir: PathBuf,
     pub access_key: String,
@@ -418,17 +616,236 @@ impl S3State {
         secret_key: String,
         bind_addr: String,
     ) -> io::Result<Self> {
-        let cas = ChunkStore::new(cas_root)?;
+        Self::with_peers(cas_root, s3_dir, access_key, secret_key, bind_addr, Vec::new())
+    }
+
+    pub fn with_peers(
+        cas_root: &Path,
+        s3_dir: &Path,
+        access_key: String,
+        secret_key: String,
+        bind_addr: String,
+        peers: Vec<String>,
+    ) -> io::Result<Self> {
+        let auth_secret = if secret_key.is_empty() {
+            None
+        } else {
+            Some(secret_key.clone())
+        };
+        let cas = ChunkStore::with_peers(cas_root, peers, auth_secret)?;
         fs::create_dir_all(s3_dir.join("buckets"))?;
         fs::create_dir_all(s3_dir.join("multipart"))?;
+        fs::create_dir_all(s3_dir.join("quotas"))?;
         let _ = fs::set_permissions(s3_dir, fs::Permissions::from_mode(0o700));
         Ok(Self {
+            cas_root: cas_root.to_path_buf(),
             cas,
             s3_dir: s3_dir.to_path_buf(),
             access_key,
             secret_key,
             bind_addr,
         })
+    }
+
+    pub fn quota_path(&self, bucket: &str) -> PathBuf {
+        self.s3_dir.join("quotas").join(format!("{}.json", bucket))
+    }
+
+    pub fn set_bucket_quota(&self, bucket: &str, max_bytes: u64) -> Result<BucketQuota, String> {
+        if !is_valid_bucket_name(bucket) {
+            return Err("InvalidBucketName".to_string());
+        }
+        let q = BucketQuota {
+            bucket: bucket.to_string(),
+            max_bytes,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        atomic_write_json(&self.quota_path(bucket), &q).map_err(|e| e.to_string())?;
+        Ok(q)
+    }
+
+    pub fn get_bucket_quota(&self, bucket: &str) -> Option<BucketQuota> {
+        let p = self.quota_path(bucket);
+        let bytes = fs::read(p).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    pub fn bucket_logical_bytes(&self, bucket: &str, exclude_key: Option<&str>) -> u64 {
+        let bdir = self.bucket_dir(bucket);
+        let mut total = 0u64;
+        if let Ok(entries) = fs::read_dir(bdir) {
+            for e in entries.flatten() {
+                if e.path().extension().and_then(|s| s.to_str()) == Some("json") {
+                    if let Ok(b) = fs::read(e.path()) {
+                        if let Ok(m) = serde_json::from_slice::<ObjectManifest>(&b) {
+                            if exclude_key.is_some_and(|ex| ex == m.key) {
+                                continue;
+                            }
+                            total = total.saturating_add(m.size);
+                        }
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    pub fn ensure_bucket_quota(
+        &self,
+        bucket: &str,
+        key: &str,
+        new_size: u64,
+    ) -> Result<(), (StatusCode, String)> {
+        if let Some(q) = self.get_bucket_quota(bucket) {
+            if q.max_bytes > 0 {
+                let current = self.bucket_logical_bytes(bucket, Some(key));
+                let projected = current.saturating_add(new_size);
+                if projected > q.max_bytes {
+                    return Err((
+                        StatusCode::INSUFFICIENT_STORAGE,
+                        format!(
+                            "QuotaExceeded: bucket '{}' quota is {} bytes, projected usage is {} bytes",
+                            bucket, q.max_bytes, projected
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn run_universal_cas_gc(&self, grace_seconds: u64, dry_run: bool) -> GcReport {
+        let mut referenced = std::collections::HashSet::new();
+        // 1. Scan MeshFS POSIX/Proxmox metadata (`/var/lib/meshfs/meta`)
+        collect_cas_hashes_from_dir(&self.cas_root.join("meta"), &mut referenced);
+        // 2. Scan MeshFS-S3 buckets and active multipart sessions (`/var/lib/meshfs/s3`)
+        collect_cas_hashes_from_dir(&self.s3_dir.join("buckets"), &mut referenced);
+        collect_cas_hashes_from_dir(&self.s3_dir.join("multipart"), &mut referenced);
+        // 3. Scan PMBS datastore if colocated (`/var/lib/pmbs`)
+        collect_cas_hashes_from_dir(Path::new("/var/lib/pmbs"), &mut referenced);
+
+        let now = std::time::SystemTime::now();
+        let mut scanned_chunks = 0usize;
+        let mut deleted_chunks = 0usize;
+        let mut reclaimed_bytes = 0u64;
+        let mut retained_physical_bytes = 0u64;
+
+        if let Ok(entries) = fs::read_dir(&self.cas.chunks_dir) {
+            for e in entries.flatten() {
+                if e.path().is_dir() {
+                    if let Ok(sub) = fs::read_dir(e.path()) {
+                        for f in sub.flatten() {
+                            let p = f.path();
+                            if !p.is_file() {
+                                continue;
+                            }
+                            let fname = f.file_name().to_string_lossy().to_string();
+                            let meta = match f.metadata() {
+                                Ok(m) => m,
+                                Err(_) => continue,
+                            };
+                            let file_len = meta.len();
+                            let age_secs = meta
+                                .modified()
+                                .ok()
+                                .and_then(|m| now.duration_since(m).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(u64::MAX);
+
+                            if fname.contains(".tmp.") {
+                                if age_secs >= grace_seconds.max(60) && !dry_run {
+                                    let _ = fs::remove_file(&p);
+                                }
+                                continue;
+                            }
+
+                            scanned_chunks += 1;
+                            if referenced.contains(&fname) || age_secs < grace_seconds {
+                                retained_physical_bytes =
+                                    retained_physical_bytes.saturating_add(file_len);
+                            } else {
+                                if !dry_run {
+                                    if fs::remove_file(&p).is_ok() {
+                                        deleted_chunks += 1;
+                                        reclaimed_bytes = reclaimed_bytes.saturating_add(file_len);
+                                    } else {
+                                        retained_physical_bytes =
+                                            retained_physical_bytes.saturating_add(file_len);
+                                    }
+                                } else {
+                                    deleted_chunks += 1;
+                                    reclaimed_bytes = reclaimed_bytes.saturating_add(file_len);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        GcReport {
+            status: "ok".to_string(),
+            dry_run,
+            grace_seconds,
+            referenced_chunks: referenced.len(),
+            scanned_chunks,
+            deleted_chunks,
+            reclaimed_bytes,
+            retained_physical_bytes,
+        }
+    }
+
+    pub fn compute_telemetry(&self) -> S3Telemetry {
+        let mut buckets_count = 0usize;
+        let mut objects_count = 0usize;
+        let mut worm_locked_objects = 0usize;
+        let mut logical_bytes = 0u64;
+
+        if let Ok(entries) = fs::read_dir(self.s3_dir.join("buckets")) {
+            for e in entries.flatten() {
+                let bpath = e.path();
+                if bpath.is_dir() {
+                    buckets_count += 1;
+                    if let Ok(objs) = fs::read_dir(&bpath) {
+                        for o in objs.flatten() {
+                            if o.path().extension().and_then(|s| s.to_str()) == Some("json") {
+                                if let Ok(bytes) = fs::read(o.path()) {
+                                    if let Ok(m) = serde_json::from_slice::<ObjectManifest>(&bytes)
+                                    {
+                                        objects_count += 1;
+                                        logical_bytes = logical_bytes.saturating_add(m.size);
+                                        if m.is_worm_locked() {
+                                            worm_locked_objects += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let (physical_cas_chunks, physical_cas_bytes) = self.cas.count_chunks_and_bytes();
+        let dedup_saved_bytes = logical_bytes.saturating_sub(physical_cas_bytes);
+        let dedup_ratio = if physical_cas_bytes > 0 && logical_bytes > 0 {
+            (logical_bytes as f64) / (physical_cas_bytes as f64)
+        } else {
+            1.0
+        };
+        let self_healed_chunks = self.cas.self_healed_chunks.load(Ordering::Relaxed);
+
+        S3Telemetry {
+            buckets_count,
+            objects_count,
+            worm_locked_objects,
+            logical_bytes,
+            physical_cas_chunks,
+            physical_cas_bytes,
+            dedup_saved_bytes,
+            dedup_ratio,
+            self_healed_chunks,
+        }
     }
 
     pub fn checked_bucket_dir(&self, bucket: &str) -> Result<PathBuf, (StatusCode, &'static str)> {
@@ -610,6 +1027,7 @@ impl S3State {
         }
         validate_retain_until(&retain_until)?;
         self.ensure_not_worm_locked(bucket, key)?;
+        self.ensure_bucket_quota(bucket, key, total_size)?;
 
         let merkle_root = compute_merkle_root(&chunks);
         let manifest = ObjectManifest {
@@ -1031,14 +1449,90 @@ fn s3_error_xml(code: StatusCode, err_code: &str, message: &str) -> Response {
 }
 
 async fn healthz_handler(State(state): State<Arc<S3State>>) -> impl IntoResponse {
-    let chunks = state.cas.count_chunks();
+    let tel = state.compute_telemetry();
     axum::Json(serde_json::json!({
         "status": "ok",
         "service": "meshfs-s3",
         "version": VERSION,
         "cas_chunks_dir": state.cas.chunks_dir,
-        "cas_chunk_count": chunks,
+        "cas_chunk_count": tel.physical_cas_chunks,
+        "physical_cas_bytes": tel.physical_cas_bytes,
+        "logical_bytes": tel.logical_bytes,
+        "dedup_saved_bytes": tel.dedup_saved_bytes,
+        "dedup_ratio": tel.dedup_ratio,
+        "self_healed_chunks": tel.self_healed_chunks,
+        "peers": state.cas.peers,
     }))
+}
+
+async fn metrics_handler(State(state): State<Arc<S3State>>) -> impl IntoResponse {
+    let tel = state.compute_telemetry();
+    let body = format!(
+        "# HELP meshfs_s3_buckets_total Number of S3 buckets\n\
+         # TYPE meshfs_s3_buckets_total gauge\n\
+         meshfs_s3_buckets_total {}\n\
+         # HELP meshfs_s3_objects_total Number of S3 objects across all buckets\n\
+         # TYPE meshfs_s3_objects_total gauge\n\
+         meshfs_s3_objects_total {}\n\
+         # HELP meshfs_s3_worm_locked_objects_total Number of active WORM-locked objects\n\
+         # TYPE meshfs_s3_worm_locked_objects_total gauge\n\
+         meshfs_s3_worm_locked_objects_total {}\n\
+         # HELP meshfs_s3_logical_bytes_total Total logical bytes stored in S3 manifests\n\
+         # TYPE meshfs_s3_logical_bytes_total gauge\n\
+         meshfs_s3_logical_bytes_total {}\n\
+         # HELP meshfs_s3_physical_cas_chunks_total Total physical 4 MiB CAS chunks on disk\n\
+         # TYPE meshfs_s3_physical_cas_chunks_total gauge\n\
+         meshfs_s3_physical_cas_chunks_total {}\n\
+         # HELP meshfs_s3_physical_cas_bytes_total Total physical CAS bytes on disk\n\
+         # TYPE meshfs_s3_physical_cas_bytes_total gauge\n\
+         meshfs_s3_physical_cas_bytes_total {}\n\
+         # HELP meshfs_s3_dedup_saved_bytes_total Bytes saved by CAS deduplication\n\
+         # TYPE meshfs_s3_dedup_saved_bytes_total gauge\n\
+         meshfs_s3_dedup_saved_bytes_total {}\n\
+         # HELP meshfs_s3_dedup_ratio Deduplication ratio (logical / physical)\n\
+         # TYPE meshfs_s3_dedup_ratio gauge\n\
+         meshfs_s3_dedup_ratio {:.4}\n\
+         # HELP meshfs_s3_self_healed_chunks_total Total CAS chunks automatically repaired via P2P self-healing\n\
+         # TYPE meshfs_s3_self_healed_chunks_total counter\n\
+         meshfs_s3_self_healed_chunks_total {}\n",
+        tel.buckets_count,
+        tel.objects_count,
+        tel.worm_locked_objects,
+        tel.logical_bytes,
+        tel.physical_cas_chunks,
+        tel.physical_cas_bytes,
+        tel.dedup_saved_bytes,
+        tel.dedup_ratio,
+        tel.self_healed_chunks,
+    );
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
+}
+
+async fn cas_chunk_handler(
+    State(state): State<Arc<S3State>>,
+    AxumPath(hash): AxumPath<String>,
+) -> Response {
+    let clean = ChunkStore::normalize_id(&hash).to_string();
+    if clean.len() != 64 || !clean.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+        return (StatusCode::BAD_REQUEST, "Invalid chunk hash").into_response();
+    }
+    let target = state.cas.chunk_path(&clean);
+    match fs::read(&target) {
+        Ok(bytes) if bytes.len() <= CHUNK_SIZE && sha256_hex(&bytes) == clean => (
+            StatusCode::OK,
+            [
+                ("content-type", "application/octet-stream"),
+                ("x-podmesh-cas-sha256", clean.as_str()),
+            ],
+            bytes,
+        )
+            .into_response(),
+        _ => (StatusCode::NOT_FOUND, "Chunk not found or corrupted").into_response(),
+    }
 }
 
 async fn root_handler(
@@ -1354,6 +1848,11 @@ async fn object_handler(
                     }
                 }
                 let merkle_root = compute_merkle_root(&combined_chunks);
+                if let Err((code, msg)) =
+                    state.ensure_bucket_quota(&bucket, &clean_key, running_offset)
+                {
+                    return s3_error_xml(code, "QuotaExceeded", &msg);
+                }
                 let manifest = ObjectManifest {
                     bucket: bucket.clone(),
                     key: clean_key.clone(),
@@ -1533,6 +2032,8 @@ async fn object_handler(
                         "ObjectLocked"
                     } else if code == StatusCode::NOT_FOUND {
                         "NoSuchBucket"
+                    } else if code == StatusCode::INSUFFICIENT_STORAGE {
+                        "QuotaExceeded"
                     } else {
                         "InternalError"
                     };
@@ -1731,6 +2232,9 @@ pub struct UdsRequest {
     pub key: Option<String>,
     pub expires_secs: Option<i64>,
     pub method: Option<String>,
+    pub grace_seconds: Option<u64>,
+    pub dry_run: Option<bool>,
+    pub max_bytes: Option<u64>,
 }
 
 async fn handle_uds_client(stream: UnixStream, state: Arc<S3State>) {
@@ -1759,15 +2263,54 @@ async fn handle_uds_client(stream: UnixStream, state: Arc<S3State>) {
                     }
                 }
                 buckets.sort();
+                let tel = state.compute_telemetry();
                 serde_json::json!({
                     "status": "ok",
                     "service": "meshfs-s3",
                     "version": VERSION,
                     "bind_addr": state.bind_addr,
                     "cas_chunks_dir": state.cas.chunks_dir,
-                    "cas_chunk_count": state.cas.count_chunks(),
+                    "cas_chunk_count": tel.physical_cas_chunks,
+                    "physical_cas_bytes": tel.physical_cas_bytes,
+                    "logical_bytes": tel.logical_bytes,
+                    "dedup_saved_bytes": tel.dedup_saved_bytes,
+                    "dedup_ratio": tel.dedup_ratio,
+                    "worm_locked_objects": tel.worm_locked_objects,
+                    "self_healed_chunks": tel.self_healed_chunks,
+                    "peers": state.cas.peers,
                     "s3_dir": state.s3_dir,
                     "buckets": buckets,
+                })
+            }
+            "gc" => {
+                let grace = req.grace_seconds.unwrap_or(3600);
+                let dry_run = req.dry_run.unwrap_or(false);
+                let rep = state.run_universal_cas_gc(grace, dry_run);
+                serde_json::to_value(rep).unwrap_or_default()
+            }
+            "quota.set" => {
+                let b = req.bucket.unwrap_or_default();
+                let max_b = req.max_bytes.unwrap_or(0);
+                match state.set_bucket_quota(&b, max_b) {
+                    Ok(q) => serde_json::json!({
+                        "status": "ok",
+                        "quota": q,
+                    }),
+                    Err(e) => serde_json::json!({
+                        "status": "error",
+                        "message": e,
+                    }),
+                }
+            }
+            "quota.get" => {
+                let b = req.bucket.unwrap_or_default();
+                let used = state.bucket_logical_bytes(&b, None);
+                let q = state.get_bucket_quota(&b);
+                serde_json::json!({
+                    "status": "ok",
+                    "bucket": b,
+                    "logical_used_bytes": used,
+                    "max_bytes": q.map(|x| x.max_bytes).unwrap_or(0),
                 })
             }
             "presign" => {
@@ -1817,6 +2360,10 @@ struct Cli {
     #[arg(long, global = true, default_value = "/var/lib/meshfs/s3.sock")]
     socket: PathBuf,
 
+    /// Optional comma-separated peer URLs for automatic P2P self-healing on bit-rot (or set MESHFS_PEERS)
+    #[arg(long, global = true)]
+    peers: Option<String>,
+
     #[arg(long, global = true)]
     json: bool,
 
@@ -1831,8 +2378,22 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:9000")]
         bind: String,
     },
-    /// Query daemon status and CAS metrics via Unix socket
+    /// Query daemon status, deduplication ratio, and CAS metrics via Unix socket
     Status,
+    /// Universal CAS Mark-and-Sweep Garbage Collector across MeshFS, MeshFS-S3, and PMBS
+    Gc {
+        /// Grace window in seconds (chunks modified more recently than this are never deleted)
+        #[arg(long, default_value_t = 3600)]
+        grace_seconds: u64,
+        /// Only report unreferenced chunks without deleting them
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Manage S3 bucket quotas
+    Quota {
+        #[command(subcommand)]
+        action: QuotaCommands,
+    },
     /// Manage S3 buckets locally
     Bucket {
         #[command(subcommand)]
@@ -1853,6 +2414,20 @@ enum Commands {
         method: String,
         #[arg(long, default_value = "http://127.0.0.1:9000")]
         endpoint: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum QuotaCommands {
+    /// Set maximum logical bytes allowed for a bucket (0 = unlimited)
+    Set {
+        bucket: String,
+        #[arg(long)]
+        max_bytes: u64,
+    },
+    /// Get current logical usage and quota for a bucket
+    Get {
+        bucket: String,
     },
 }
 
@@ -1888,6 +2463,33 @@ enum ObjectCommands {
     },
 }
 
+fn load_peers(cli_peers: Option<&str>) -> Vec<String> {
+    let mut raw = cli_peers.unwrap_or("").to_string();
+    if raw.is_empty() {
+        raw = std::env::var("MESHFS_PEERS")
+            .or_else(|_| std::env::var("MESHFS_S3_PEERS"))
+            .unwrap_or_default();
+    }
+    if raw.is_empty() {
+        if let Ok(content) = fs::read_to_string("/etc/meshfs/s3.env") {
+            for line in content.lines() {
+                let line = line.trim();
+                if let Some(v) = line
+                    .strip_prefix("MESHFS_PEERS=")
+                    .or_else(|| line.strip_prefix("MESHFS_S3_PEERS="))
+                {
+                    raw = v.trim_matches('"').trim_matches('\'').to_string();
+                    break;
+                }
+            }
+        }
+    }
+    raw.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn load_credentials(require_non_empty: bool) -> Result<(String, String), String> {
     let mut ak = std::env::var("MESHFS_S3_ACCESS_KEY").unwrap_or_default();
     let mut sk = std::env::var("MESHFS_S3_SECRET_KEY").unwrap_or_default();
@@ -1918,6 +2520,7 @@ fn load_credentials(require_non_empty: bool) -> Result<(String, String), String>
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let peers = load_peers(cli.peers.as_deref());
 
     match cli.command {
         Commands::Daemon { bind } => {
@@ -1934,12 +2537,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .init();
 
-            let state = Arc::new(S3State::new(
+            let state = Arc::new(S3State::with_peers(
                 &cli.cas_dir,
                 &cli.s3_dir,
                 access_key,
                 secret_key,
                 effective_bind.clone(),
+                peers,
             )?);
 
             let sock_path = cli.socket.clone();
@@ -1963,6 +2567,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let app = Router::new()
                 .route("/healthz", get(healthz_handler))
+                .route("/metrics", get(metrics_handler))
+                .route("/cas/chunk/:hash", get(cas_chunk_handler))
                 .route("/", get(root_handler))
                 .route("/:bucket", any(bucket_handler))
                 .route("/:bucket/*key", any(object_handler))
@@ -1987,14 +2593,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", buf.trim());
         }
 
-        Commands::Bucket { action } => {
+        Commands::Gc {
+            grace_seconds,
+            dry_run,
+        } => {
+            if let Ok(mut stream) = UnixStream::connect(&cli.socket).await {
+                let req = serde_json::json!({
+                    "op": "gc",
+                    "grace_seconds": grace_seconds,
+                    "dry_run": dry_run,
+                });
+                stream
+                    .write_all(format!("{}\n", req).as_bytes())
+                    .await?;
+                let mut buf = String::new();
+                BufReader::new(stream).read_line(&mut buf).await?;
+                println!("{}", buf.trim());
+            } else {
+                let (access_key, secret_key) = load_credentials(false)?;
+                let state = S3State::with_peers(
+                    &cli.cas_dir,
+                    &cli.s3_dir,
+                    access_key,
+                    secret_key,
+                    "127.0.0.1:9000".to_string(),
+                    peers,
+                )?;
+                let rep = state.run_universal_cas_gc(grace_seconds, dry_run);
+                println!("{}", serde_json::to_string(&rep)?);
+            }
+        }
+
+        Commands::Quota { action } => {
             let (access_key, secret_key) = load_credentials(false)?;
-            let state = S3State::new(
+            let state = S3State::with_peers(
                 &cli.cas_dir,
                 &cli.s3_dir,
                 access_key,
                 secret_key,
                 "127.0.0.1:9000".to_string(),
+                peers,
+            )?;
+            match action {
+                QuotaCommands::Set { bucket, max_bytes } => {
+                    let q = state.set_bucket_quota(&bucket, max_bytes)?;
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "ok",
+                            "action": "quota.set",
+                            "bucket": q.bucket,
+                            "max_bytes": q.max_bytes,
+                            "updated_at": q.updated_at,
+                        })
+                    );
+                }
+                QuotaCommands::Get { bucket } => {
+                    let used = state.bucket_logical_bytes(&bucket, None);
+                    let q = state.get_bucket_quota(&bucket);
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "ok",
+                            "bucket": bucket,
+                            "logical_used_bytes": used,
+                            "max_bytes": q.map(|x| x.max_bytes).unwrap_or(0),
+                        })
+                    );
+                }
+            }
+        }
+
+        Commands::Bucket { action } => {
+            let (access_key, secret_key) = load_credentials(false)?;
+            let state = S3State::with_peers(
+                &cli.cas_dir,
+                &cli.s3_dir,
+                access_key,
+                secret_key,
+                "127.0.0.1:9000".to_string(),
+                peers,
             )?;
             match action {
                 BucketCommands::Create { name } => {
@@ -2037,12 +2715,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Commands::Object { action } => {
             let (access_key, secret_key) = load_credentials(false)?;
-            let state = S3State::new(
+            let state = S3State::with_peers(
                 &cli.cas_dir,
                 &cli.s3_dir,
                 access_key,
                 secret_key,
                 "127.0.0.1:9000".to_string(),
+                peers,
             )?;
             match action {
                 ObjectCommands::Put {
@@ -2347,6 +3026,61 @@ mod tests {
         assert!(!is_valid_bucket_name(".hidden"));
         assert!(is_valid_bucket_name("qualification-s3"));
         assert!(!is_valid_upload_id("../../../etc"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_universal_gc_and_bucket_quota() {
+        let tmp = std::env::temp_dir().join(format!("meshfs-s3-gc-quota-{}", std::process::id()));
+        let cas_dir = tmp.join("cas");
+        let s3_dir = tmp.join("s3");
+        let state = S3State::new(
+            &cas_dir,
+            &s3_dir,
+            "PMTESTKEY1234567890".to_string(),
+            "secret-test-key-0123456789abcdef".to_string(),
+            "127.0.0.1:9000".to_string(),
+        )
+        .unwrap();
+
+        fs::create_dir_all(state.bucket_dir("qtest")).unwrap();
+        state.set_bucket_quota("qtest", 1024).unwrap();
+
+        // Put 600 bytes -> OK
+        let data1 = vec![0x41u8; 600];
+        state
+            .put_object(
+                "qtest",
+                "k1.bin",
+                &data1,
+                "application/octet-stream".to_string(),
+                None,
+                None,
+                BTreeMap::new(),
+            )
+            .unwrap();
+
+        // Put another 600 bytes under k2.bin -> exceeds 1024 byte quota -> 507 InsufficientStorage!
+        let data2 = vec![0x42u8; 600];
+        let err = state
+            .put_object(
+                "qtest",
+                "k2.bin",
+                &data2,
+                "application/octet-stream".to_string(),
+                None,
+                None,
+                BTreeMap::new(),
+            )
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::INSUFFICIENT_STORAGE);
+
+        // Now test Universal GC: data2 wrote 1 orphan chunk before manifest sealing was rejected by quota!
+        let rep = state.run_universal_cas_gc(0, false);
+        assert_eq!(rep.referenced_chunks, 1);
+        assert_eq!(rep.deleted_chunks, 1);
+        assert_eq!(rep.reclaimed_bytes, 600);
 
         let _ = fs::remove_dir_all(&tmp);
     }

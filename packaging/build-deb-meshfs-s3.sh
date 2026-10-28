@@ -34,7 +34,7 @@ mkdir -p -m 0755 "${BUILD_DIR}/usr" "${BUILD_DIR}/usr/bin" "${BUILD_DIR}/usr/lib
 mkdir -p -m 0755 "${BUILD_DIR}/etc" "${BUILD_DIR}/var" "${BUILD_DIR}/var/lib"
 mkdir -p -m 0700 "${BUILD_DIR}/etc/meshfs"
 mkdir -p -m 0700 "${BUILD_DIR}/var/lib/meshfs" "${BUILD_DIR}/var/lib/meshfs/s3" \
-  "${BUILD_DIR}/var/lib/meshfs/s3/buckets" "${BUILD_DIR}/var/lib/meshfs/s3/multipart"
+  "${BUILD_DIR}/var/lib/meshfs/s3/buckets" "${BUILD_DIR}/var/lib/meshfs/s3/multipart" "${BUILD_DIR}/var/lib/meshfs/s3/quotas"
 
 install -m 0755 "${RUST_BIN}" "${BUILD_DIR}/usr/bin/meshfs-s3"
 
@@ -112,6 +112,7 @@ if [ "$1" = "configure" ]; then
     install -d -m 0700 -o root -g root /var/lib/meshfs/s3
     install -d -m 0700 -o root -g root /var/lib/meshfs/s3/buckets
     install -d -m 0700 -o root -g root /var/lib/meshfs/s3/multipart
+    install -d -m 0700 -o root -g root /var/lib/meshfs/s3/quotas
 
     ENV_FILE="/etc/meshfs/s3.env"
     if [ ! -f "$ENV_FILE" ] || ! grep -q "^MESHFS_S3_SECRET_KEY=" "$ENV_FILE" 2>/dev/null; then
