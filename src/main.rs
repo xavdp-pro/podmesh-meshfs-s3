@@ -2812,13 +2812,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "bucket": bucket,
                                 "key": key,
                                 "bytes_written": bytes.len(),
-                                "sha256": sha256_hex(&bytes),
+                                "blake3": blake3_hex(&bytes),
                             })
                         );
                     } else {
                         // Bounded-memory streaming write chunk by chunk!
                         let mut out_file = BufWriter::new(File::create(&output)?);
-                        let mut hasher = Sha256::new();
+                        let mut hasher = blake3::Hasher::new();
                         let mut written = 0u64;
                         for c in &manifest.chunks {
                             let chunk_bytes = state.cas.read_chunk(&c.id)?;
@@ -2834,7 +2834,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "bucket": bucket,
                                 "key": key,
                                 "bytes_written": written,
-                                "sha256": hex::encode(hasher.finalize()),
+                                "blake3": hasher.finalize().to_hex().to_string(),
                             })
                         );
                     }
