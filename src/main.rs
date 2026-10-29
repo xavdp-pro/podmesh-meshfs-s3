@@ -51,7 +51,7 @@ pub fn blake3_hex(data: &[u8]) -> String {
 }
 
 pub fn verify_cas_digest(data: &[u8], expected_clean: &str) -> bool {
-    blake3_hex(data) == expected_clean || sha256_hex(data) == expected_clean
+    blake3_hex(data) == expected_clean
 }
 
 pub fn sha256_hex(data: &[u8]) -> String {
@@ -218,9 +218,7 @@ impl ChunkStore {
     }
 
     pub fn normalize_id(id: &str) -> &str {
-        id.strip_prefix("blake3:")
-            .or_else(|| id.strip_prefix("sha256:"))
-            .unwrap_or(id)
+        id.strip_prefix("blake3:").unwrap_or(id)
     }
 
     pub fn chunk_path(&self, chunk_id: &str) -> PathBuf {
@@ -567,10 +565,9 @@ fn collect_cas_hashes_from_value(
         }
         serde_json::Value::Object(map) => {
             for (k, v) in map {
-                // Collect 64-hex strings from chunk/digest fields or blake3:/sha256:-prefixed strings
+                // Collect 64-hex strings from chunk/digest fields or blake3:-prefixed strings
                 if let serde_json::Value::String(s) = v {
                     if s.starts_with("blake3:")
-                        || s.starts_with("sha256:")
                         || k == "id"
                         || k == "chunk"
                         || k == "hash"
@@ -875,7 +872,7 @@ impl S3State {
     }
 
     pub fn object_manifest_path(&self, bucket: &str, key: &str) -> PathBuf {
-        let key_hash = sha256_hex(key.as_bytes());
+        let key_hash = blake3_hex(key.as_bytes());
         self.bucket_dir(bucket).join(format!("{}.json", key_hash))
     }
 
@@ -1542,7 +1539,6 @@ async fn cas_chunk_handler(
             [
                 ("content-type", "application/octet-stream"),
                 ("x-podmesh-cas-blake3", clean.as_str()),
-                ("x-podmesh-cas-sha256", clean.as_str()),
             ],
             bytes,
         )
@@ -1752,7 +1748,7 @@ async fn object_handler(
                     .map(|s| s.to_string());
                 let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
                 let upload_id =
-                    sha256_hex(format!("{}:{}:{}", bucket, clean_key, nanos).as_bytes());
+                    blake3_hex(format!("{}:{}:{}", bucket, clean_key, nanos).as_bytes());
                 let mdir = state.s3_dir.join("multipart").join(&upload_id);
                 let meta = MultipartSessionMeta {
                     upload_id: upload_id.clone(),

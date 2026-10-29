@@ -13,7 +13,7 @@ set -euo pipefail
 umask 0022
 
 PKG_NAME="podmesh-meshfs-s3"
-PKG_VERSION="2.3.0"
+PKG_VERSION="2.4.1"
 PKG_ARCH="amd64"
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$(mktemp -d /tmp/build-${PKG_NAME}.XXXXXX)"
