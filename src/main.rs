@@ -39,12 +39,20 @@ use tokio::{
     net::{UnixListener, UnixStream},
 };
 
-pub const VERSION: &str = "2.3.0";
+pub const VERSION: &str = "2.4.1";
 pub const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MiB canonical MeshFS CAS chunk size
 
 // =============================================================================
-// Cryptographic Helpers (SHA-256, RFC 2104 HMAC-SHA256, AWS SigV4 Key Derivation)
+// Cryptographic Helpers (BLAKE3 SIMD CAS + RFC 2104 HMAC-SHA256 for AWS SigV4)
 // =============================================================================
+
+pub fn blake3_hex(data: &[u8]) -> String {
+    blake3::hash(data).to_hex().to_string()
+}
+
+pub fn verify_cas_digest(data: &[u8], expected_clean: &str) -> bool {
+    blake3_hex(data) == expected_clean || sha256_hex(data) == expected_clean
+}
 
 pub fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -210,7 +218,9 @@ impl ChunkStore {
     }
 
     pub fn normalize_id(id: &str) -> &str {
-        id.strip_prefix("sha256:").unwrap_or(id)
+        id.strip_prefix("blake3:")
+            .or_else(|| id.strip_prefix("sha256:"))
+            .unwrap_or(id)
     }
 
     pub fn chunk_path(&self, chunk_id: &str) -> PathBuf {
@@ -220,19 +230,19 @@ impl ChunkStore {
     }
 
     pub fn write_chunk(&self, data: &[u8]) -> io::Result<(String, bool)> {
-        let digest = sha256_hex(data);
+        let digest = blake3_hex(data);
         let target_file = self.chunk_path(&digest);
 
         if target_file.exists() {
             if let Ok(existing) = fs::read(&target_file) {
-                if existing.len() <= CHUNK_SIZE && sha256_hex(&existing) == digest {
-                    return Ok((format!("sha256:{}", digest), false));
+                if existing.len() <= CHUNK_SIZE && verify_cas_digest(&existing, &digest) {
+                    return Ok((format!("blake3:{}", digest), false));
                 }
             }
         }
 
         self.write_verified_chunk_raw(&digest, data)?;
-        Ok((format!("sha256:{}", digest), true))
+        Ok((format!("blake3:{}", digest), true))
     }
 
     pub fn write_verified_chunk_raw(&self, clean_digest: &str, data: &[u8]) -> io::Result<()> {
@@ -293,7 +303,7 @@ impl ChunkStore {
                     if let Ok(resp) = req.send() {
                         if resp.status().is_success() {
                             if let Ok(bytes) = resp.bytes() {
-                                if bytes.len() <= CHUNK_SIZE && sha256_hex(&bytes) == clean_owned {
+                                if bytes.len() <= CHUNK_SIZE && verify_cas_digest(&bytes, &clean_owned) {
                                     tracing::warn!(
                                         chunk = %clean_owned,
                                         peer = %base,
@@ -341,8 +351,8 @@ impl ChunkStore {
                         "oversized CAS chunk",
                     ));
                 }
-                let actual = sha256_hex(&buf);
-                if actual != clean {
+                if !verify_cas_digest(&buf, clean) {
+                    let actual = blake3_hex(&buf);
                     if let Some(healed) = self.try_heal_from_peers(clean) {
                         return Ok(healed);
                     }
@@ -466,14 +476,14 @@ pub struct MultipartSessionMeta {
 
 pub fn compute_merkle_root(chunks: &[ChunkRef]) -> String {
     if chunks.is_empty() {
-        return sha256_hex(b"");
+        return blake3_hex(b"");
     }
     let mut combined = String::new();
     for c in chunks {
         combined.push_str(ChunkStore::normalize_id(&c.id));
         combined.push(':');
     }
-    sha256_hex(combined.as_bytes())
+    blake3_hex(combined.as_bytes())
 }
 
 pub fn atomic_write_json<T: Serialize>(target: &Path, value: &T) -> io::Result<()> {
@@ -541,7 +551,7 @@ fn collect_cas_hashes_from_value(
 ) {
     match val {
         serde_json::Value::String(s) => {
-            let clean = s.strip_prefix("sha256:").unwrap_or(s.as_str());
+            let clean = ChunkStore::normalize_id(s.as_str());
             if clean.len() == 64
                 && clean
                     .bytes()
@@ -557,9 +567,14 @@ fn collect_cas_hashes_from_value(
         }
         serde_json::Value::Object(map) => {
             for (k, v) in map {
-                // Only collect 64-hex strings from chunk/digest fields or sha256:-prefixed strings
+                // Collect 64-hex strings from chunk/digest fields or blake3:/sha256:-prefixed strings
                 if let serde_json::Value::String(s) = v {
-                    if s.starts_with("sha256:") || k == "id" || k == "chunk" || k == "hash" {
+                    if s.starts_with("blake3:")
+                        || s.starts_with("sha256:")
+                        || k == "id"
+                        || k == "chunk"
+                        || k == "hash"
+                    {
                         collect_cas_hashes_from_value(v, referenced);
                     }
                 } else {
@@ -1522,10 +1537,11 @@ async fn cas_chunk_handler(
     }
     let target = state.cas.chunk_path(&clean);
     match fs::read(&target) {
-        Ok(bytes) if bytes.len() <= CHUNK_SIZE && sha256_hex(&bytes) == clean => (
+        Ok(bytes) if bytes.len() <= CHUNK_SIZE && verify_cas_digest(&bytes, &clean) => (
             StatusCode::OK,
             [
                 ("content-type", "application/octet-stream"),
+                ("x-podmesh-cas-blake3", clean.as_str()),
                 ("x-podmesh-cas-sha256", clean.as_str()),
             ],
             bytes,
@@ -2946,6 +2962,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(m1.chunks.len(), 2);
+        assert!(m1.chunks[0].id.starts_with("blake3:"));
         assert_eq!(new1, 2);
         assert!(m1.is_worm_locked());
 

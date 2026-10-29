@@ -1,9 +1,9 @@
 [package]
 name = "meshfs-s3"
-version = "2.3.0"
+version = "2.4.1"
 edition = "2021"
 authors = ["Xavier de Poorter <xavier@xavdp.pro>", "PodMesh Team"]
-description = "Sovereign S3-Compatible Object Storage Gateway backed by MeshFS 4 MiB SHA-256 CAS (v2.3.0)"
+description = "Sovereign S3-Compatible Object Storage Gateway backed by MeshFS 4 MiB BLAKE3 CAS (v2.4.1)"
 license = "AGPL-3.0-or-later"
 
 [[bin]]
@@ -16,6 +16,7 @@ axum = { version = "0.7" }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+blake3 = "1.5"
 sha2 = "0.10"
 hex = "0.4"
 clap = { version = "4.4", features = ["derive"] }
