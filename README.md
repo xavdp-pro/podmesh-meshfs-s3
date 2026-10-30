@@ -1,4 +1,4 @@
-# `podmesh-meshfs-s3` (`v2.3.0`) — Sovereign S3 Gateway on MeshFS 4 MiB CAS
+# `podmesh-meshfs-s3` (`v2.4.1`) — Sovereign S3 Gateway on MeshFS 4 MiB CAS
 
 `podmesh-meshfs-s3` (`/usr/bin/meshfs-s3`) is the **Pure Rust S3-Compatible Object Storage Gateway** for the PodMesh and MeshFS ecosystem on Debian 13 (Trixie) and Proxmox VE 9.x.
 
@@ -9,7 +9,7 @@
 ## Key Capabilities
 
 1. **Universal Cross-Protocol Deduplication (`/var/lib/meshfs/chunks/`)**:
-   - Shares the exact same 4 MiB SHA-256 Content-Addressable Storage (CAS) chunk store as [`podmesh-meshfs`](https://github.com/xavdp-pro/podmesh-meshfs).
+   - Shares the exact same 4 MiB BLAKE3 Content-Addressable Storage (CAS) chunk store as [`podmesh-meshfs`](https://github.com/xavdp-pro/podmesh-meshfs).
    - Objects uploaded via S3 are automatically deduplicated at 4 MiB block granularity against Proxmox VE VM disks, Podman container volumes, and other S3 buckets.
 2. **$\mathcal{O}(1)$ Multipart Upload Completion**:
    - `CreateMultipartUpload`, `UploadPart`, and `CompleteMultipartUpload` assemble multi-gigabyte objects in $< 2\text{ ms}$ by concatenating SHA-256 chunk descriptor lists in the Merkle manifest without rewriting payload bytes on disk.
@@ -33,7 +33,7 @@ sudo apt-get install -y podmesh-meshfs podmesh-meshfs-s3
 
 ## Repository Structure
 
-- `src/main.rs` — Pure Rust `meshfs-s3` S3 REST server (`axum`), shared 4 MiB SHA-256 CAS engine, UDS control server, and CLI.
+- `src/main.rs` — Pure Rust `meshfs-s3` S3 REST server (`axum`), shared 4 MiB BLAKE3 CAS engine, UDS control server, and CLI.
 - `packaging/build-deb-meshfs-s3.sh` — Reproducible Debian 13 `.deb` builder (`podmesh-meshfs-s3_2.3.0_amd64.deb`).
 - `AI_INSTALL_AND_CONFIG.md` — 100% headless AI-First installation and configuration specification.
 - `INTENT.md`, `LAW.md`, `LINEAGE.md`, `AGENTS.md`, `DEDICATION.md`, `LICENSE`.

@@ -1,7 +1,7 @@
-# LAW — Architectural & Mathematical Invariants of `podmesh-meshfs-s3` (v2.3.0)
+# LAW — Architectural & Mathematical Invariants of `podmesh-meshfs-s3` (v2.4.1)
 
 1. **Universal CAS Isomorphism ($\Omega_{\text{CAS}}$)**:
-   - Every S3 object $O = (B, K)$ is represented as an atomic JSON Merkle manifest $\mathcal{M}_{B,K}$ referencing immutable $\le 4\text{ MiB}$ SHA-256 chunks in `/var/lib/meshfs/chunks/<prefix>/<sha256>`.
+   - Every S3 object $O = (B, K)$ is represented as an atomic JSON Merkle manifest $\mathcal{M}_{B,K}$ referencing immutable $\le 4\text{ MiB}$ SHA-256 chunks in `/var/lib/meshfs/chunks/<prefix>/<blake3>`.
    - Silent data corruption (bit-rot) is impossible: every chunk read verifies $\text{SHA256}(\text{bytes}) \equiv h_i$ before streaming to the client.
 2. **Atomic Crash-Safe Persistence**:
    - Both CAS chunks and S3 object manifests are written to temporary files (`*.tmp.<pid>.<seq>`), flushed via `sync_all()` (`fsync`), and promoted via atomic POSIX `rename()` followed by parent directory `sync_all()`.

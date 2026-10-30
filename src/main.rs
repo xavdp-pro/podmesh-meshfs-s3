@@ -2360,10 +2360,10 @@ async fn handle_uds_client(stream: UnixStream, state: Arc<S3State>) {
 #[command(
     name = "meshfs-s3",
     version = VERSION,
-    about = "MeshFS S3 Gateway (v2.3.0) — Sovereign S3 Object Storage backed by 4 MiB SHA-256 CAS"
+    about = "MeshFS S3 Gateway (v2.4.1) — Sovereign S3 Object Storage backed by 4 MiB BLAKE3 CAS"
 )]
 struct Cli {
-    #[arg(long, global = true, default_value = "/var/lib/meshfs")]
+    #[arg(long, visible_alias = "data-dir", global = true, default_value = "/var/lib/meshfs")]
     cas_dir: PathBuf,
 
     #[arg(long, global = true, default_value = "/var/lib/meshfs/s3")]
@@ -2531,7 +2531,16 @@ fn load_credentials(require_non_empty: bool) -> Result<(String, String), String>
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    if cli.cas_dir != Path::new("/var/lib/meshfs") && cli.s3_dir == Path::new("/var/lib/meshfs/s3") {
+        cli.s3_dir = cli.cas_dir.join("s3");
+    }
+    if cli.socket == Path::new("/var/lib/meshfs/s3.sock")
+        && !cli.socket.exists()
+        && Path::new("/run/shaper/s3.sock").exists()
+    {
+        cli.socket = PathBuf::from("/run/shaper/s3.sock");
+    }
     let peers = load_peers(cli.peers.as_deref());
 
     match cli.command {
