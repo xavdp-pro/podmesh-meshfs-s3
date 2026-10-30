@@ -93,7 +93,7 @@ Depends: libc6 (>= 2.38), podmesh-meshfs (>= 2.3.0)
 Provides: meshfs-s3, podmesh-s3
 Maintainer: Xavier de Poorter <xavier@xavdp.pro>
 Homepage: https://github.com/xavdp-pro/podmesh-meshfs-s3
-Description: Sovereign S3-Compatible Object Storage Gateway backed by MeshFS CAS (v2.3.0)
+Description: Sovereign S3-Compatible Object Storage Gateway backed by MeshFS CAS (v2.4.1)
  Pure Rust S3 Object Storage Gateway and AI-First CLI sharing the MeshFS
  4 MiB FastCDC SHA-256 Content-Addressable Storage pool. Supports O(1)
  Multipart Upload sealing, HTTP 206 Range slicing, WORM Object Lock
@@ -138,7 +138,7 @@ EOT
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl enable meshfs-s3.service >/dev/null 2>&1 || true
         systemctl restart meshfs-s3.service >/dev/null 2>&1 || true
-        echo "[MeshFS-S3] Service meshfs-s3.service (v2.3.0) enabled and started on 127.0.0.1:9000 + /var/lib/meshfs/s3.sock."
+        echo "[MeshFS-S3] Service meshfs-s3.service (v2.4.1) enabled and started on 127.0.0.1:9000 + /var/lib/meshfs/s3.sock."
     fi
 fi
 
